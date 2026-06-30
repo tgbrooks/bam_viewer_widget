@@ -1,3 +1,7 @@
+import os
+
+import polars_bio as pb
+
 from bam_viewer import _data
 from bam_viewer.widget import BamViewer, _read_bam_contigs
 
@@ -66,7 +70,8 @@ def test_query_reads_empty(bam_path):
 
 
 def test_query_features(gtf_path):
-    out = _data.query_features(gtf_path, "chr1", 1, 10_000)
+    gtf = _data.load_gtf(gtf_path)
+    out = _data.query_features(gtf, "chr1", 1, 10_000)
     feats = out["features"]
     transcripts = [f for f in feats if f["exons"]]
     assert transcripts, "expected a transcript model with exons"
@@ -80,7 +85,7 @@ def test_query_features(gtf_path):
 def test_query_features_drops_redundant_gene_span(gtf_path):
     # The GTF has both a `gene` and a `transcript` line for G1; only the
     # transcript model (with exons) should remain — not a duplicate gene bar.
-    out = _data.query_features(gtf_path, "chr1", 1, 10_000)
+    out = _data.query_features(_data.load_gtf(gtf_path), "chr1", 1, 10_000)
     assert len(out["features"]) == 1
     assert out["features"][0]["exons"]
 
@@ -93,15 +98,38 @@ def test_query_features_gene_only_gtf(tmp_path):
         'chr1\tt\tgene\t100\t500\t.\t+\t.\tgene_id "GA"; gene_name "Alpha";\n'  # dup
         'chr1\tt\tgene\t800\t900\t.\t-\t.\tgene_id "GB"; gene_name "Beta";\n'
     )
-    out = _data.query_features(str(p), "chr1", 1, 1000)
+    out = _data.query_features(_data.load_gtf(str(p)), "chr1", 1, 1000)
     names = sorted(f["name"] for f in out["features"])
     assert names == ["Alpha", "Beta"]  # deduped
     assert all(f["exons"] == [] for f in out["features"])
 
 
+def test_load_gtf_accepts_raw_dataframe(gtf_path):
+    # Passing the nested-attributes DataFrame from read_gtf should work: the
+    # gene_id/transcript_id/gene_name are extracted from `attributes`.
+    raw = pb.read_gtf(gtf_path)  # no attr_fields -> nested `attributes` column
+    assert "attributes" in raw.columns
+    gtf = _data.load_gtf(raw)
+    assert {"gene_id", "transcript_id", "gene_name"} <= set(gtf.columns)
+    out = _data.query_features(gtf, "chr1", 1, 10_000)
+    assert out["features"][0]["name"] == "GeneOne"
+
+
+def test_load_gtf_preloads_once(gtf_path):
+    # query_features must not touch the file: filtering a preloaded frame works
+    # even if the original path is gone.
+    import shutil
+    tmp = gtf_path + ".copy.gtf"
+    shutil.copy(gtf_path, tmp)
+    gtf = _data.load_gtf(tmp)
+    os.remove(tmp)
+    out = _data.query_features(gtf, "chr1", 1, 10_000)
+    assert out["features"]
+
+
 def test_query_features_region_filter(gtf_path):
     # A window past the gene should return nothing.
-    out = _data.query_features(gtf_path, "chr1", 20_000, 30_000)
+    out = _data.query_features(_data.load_gtf(gtf_path), "chr1", 20_000, 30_000)
     assert out["features"] == []
 
 

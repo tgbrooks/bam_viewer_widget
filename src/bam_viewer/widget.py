@@ -18,6 +18,7 @@ import anywidget
 import traitlets
 
 from . import _data
+from ._data import GtfSource
 
 _STATIC = pathlib.Path(__file__).parent / "static"
 
@@ -60,7 +61,11 @@ class BamViewer(anywidget.AnyWidget):
         Initial view as ``"chrom:start-end"`` (1-based, commas allowed) or just
         ``"chrom"`` to start at the contig's beginning.
     gtf_tracks:
-        Optional mapping of ``{track_name: gtf_path}`` rendered as gene tracks.
+        Optional mapping of ``{track_name: source}`` rendered as gene tracks.
+        Each ``source`` is a GTF path or an already-loaded polars
+        ``DataFrame`` / ``LazyFrame`` (e.g. ``polars_bio.read_gtf(...)``). The
+        whole annotation is preloaded into memory and filtered per view, since
+        GTFs are small and usually unindexed.
     max_window:
         Largest window (in bp) that will be rendered. Zooming out past this
         shows a "zoom in" message instead of loading data.
@@ -94,7 +99,7 @@ class BamViewer(anywidget.AnyWidget):
         self,
         bam_path: Union[str, pathlib.Path],
         region: Optional[str] = None,
-        gtf_tracks: Optional[Mapping[str, Union[str, pathlib.Path]]] = None,
+        gtf_tracks: Optional[Mapping[str, GtfSource]] = None,
         *,
         max_window: int = 100_000,
         max_reads: int = 5000,
@@ -110,8 +115,10 @@ class BamViewer(anywidget.AnyWidget):
                 f"indexed (e.g. `samtools index {bam_path}`)."
             )
 
-        self._gtf_tracks = {
-            name: str(path) for name, path in (gtf_tracks or {}).items()
+        # Preload each GTF track once into an in-memory frame; per-view
+        # filtering is then just an in-memory operation.
+        self._gtf_frames = {
+            name: _data.load_gtf(src) for name, src in (gtf_tracks or {}).items()
         }
         contigs = _read_bam_contigs(bam_path)
         chrom, start, end = self._initial_region(region, contigs)
@@ -123,7 +130,7 @@ class BamViewer(anywidget.AnyWidget):
             bam_path=bam_path,
             max_window=max_window,
             max_reads=max_reads,
-            track_names=list(self._gtf_tracks),
+            track_names=list(self._gtf_frames),
             contigs=contigs,
             _view=[chrom, start, end],
             **kwargs,
@@ -178,8 +185,8 @@ class BamViewer(anywidget.AnyWidget):
                 self.bam_path, chrom, start, end, max_reads=self.max_reads
             )
             self._feature_data = [
-                {"name": name, **_data.query_features(path, chrom, start, end)}
-                for name, path in self._gtf_tracks.items()
+                {"name": name, **_data.query_features(df, chrom, start, end)}
+                for name, df in self._gtf_frames.items()
             ]
             self._message = ""
         except Exception:  # surface load errors in the widget, don't crash

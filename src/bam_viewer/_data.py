@@ -8,11 +8,14 @@ matches the GTF convention so reads and annotations line up.
 
 from __future__ import annotations
 
+import os
 import re
-from typing import Optional
+from typing import Optional, Union
 
 import polars as pl
 import polars_bio as pb
+
+GtfSource = Union[str, "os.PathLike", pl.DataFrame, pl.LazyFrame]
 
 # CIGAR operations that consume the reference and so advance the genomic
 # position.  ``N`` (skipped region, e.g. an intron) also consumes the
@@ -142,30 +145,90 @@ _EXONIC = frozenset({"exon"})
 _CDS = frozenset({"CDS"})
 _SPAN_TYPES = frozenset({"transcript", "mRNA", "gene"})
 
+_GTF_CORE = ("chrom", "start", "end", "type", "strand")
+_GTF_ATTR_FIELDS = ("gene_id", "transcript_id", "gene_name")
+
+
+def _extract_attr(tag: str) -> pl.Expr:
+    """Pull a single attribute value out of polars-bio's nested ``attributes``
+    column (``List(Struct{tag, value})``)."""
+    return (
+        pl.col("attributes")
+        .list.eval(
+            pl.element()
+            .struct.field("value")
+            .filter(pl.element().struct.field("tag") == tag)
+        )
+        .list.first()
+        .alias(tag)
+    )
+
+
+def load_gtf(source: GtfSource) -> pl.DataFrame:
+    """Load a GTF annotation track fully into memory, ready for repeated
+    region queries.
+
+    ``source`` may be a path (``str`` / ``os.PathLike``), or an already-loaded
+    polars ``DataFrame`` / ``LazyFrame`` — e.g. the result of
+    ``polars_bio.read_gtf(...)``.  GTFs are small and usually unindexed, so the
+    whole annotation is held in memory and filtered per region rather than
+    re-read from disk on every pan/zoom.
+
+    The returned frame is normalised to columns
+    ``chrom, start, end, type, strand, gene_id, transcript_id, gene_name``.
+    """
+    if isinstance(source, (str, os.PathLike)):
+        df = pb.read_gtf(os.fspath(source), attr_fields=list(_GTF_ATTR_FIELDS))
+    elif isinstance(source, pl.LazyFrame):
+        df = source.collect()
+    elif isinstance(source, pl.DataFrame):
+        df = source
+    else:
+        raise TypeError(
+            "GTF track must be a path, polars DataFrame, or LazyFrame; got "
+            f"{type(source).__name__}"
+        )
+
+    missing = [c for c in _GTF_CORE if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"GTF frame is missing required column(s) {missing}. Expected the "
+            f"polars-bio GTF schema with columns {_GTF_CORE} (load it with "
+            "polars_bio.read_gtf)."
+        )
+
+    have_attrs = "attributes" in df.columns
+    exprs = []
+    for tag in _GTF_ATTR_FIELDS:
+        if tag in df.columns:
+            continue
+        exprs.append(_extract_attr(tag) if have_attrs
+                     else pl.lit(None, dtype=pl.Utf8).alias(tag))
+    if exprs:
+        df = df.with_columns(exprs)
+    return df.select([*_GTF_CORE, *_GTF_ATTR_FIELDS])
+
 
 def query_features(
-    gtf_path: str,
+    gtf: pl.DataFrame,
     chrom: str,
     start: int,
     end: int,
     *,
     max_features: int = 2000,
 ) -> dict:
-    """Load GTF features overlapping ``chrom:start-end`` as transcript models.
+    """Group GTF features overlapping ``chrom:start-end`` into gene models.
 
-    GTF files are not indexed, so the whole file is scanned, but annotation
-    files are small and the scan is lazy + filtered.  Features are grouped by
-    ``transcript_id`` into models carrying their exon (and CDS) blocks so the
-    frontend can draw a familiar exon/intron gene track.
+    ``gtf`` is a preloaded, normalised frame from :func:`load_gtf`.  Filtering
+    is an in-memory operation, so panning/zooming never re-reads the file.
+    Features are grouped by ``transcript_id`` into models carrying their exon
+    (and CDS) blocks so the frontend can draw a familiar exon/intron track.
     """
-    attr_fields = ["gene_id", "transcript_id", "gene_name"]
-    lf = pb.scan_gtf(gtf_path, attr_fields=attr_fields)
-    df = lf.filter(
+    df = gtf.filter(
         (pl.col("chrom") == chrom)
         & (pl.col("end") >= start)
         & (pl.col("start") <= end)
-    ).select(["start", "end", "type", "strand", *attr_fields])
-    df = df.collect()
+    )
 
     # Group rows into transcript models keyed by transcript_id. Bare gene-span
     # rows are tracked separately and only kept when no transcript represents

@@ -17,7 +17,9 @@ itself.
 - **Pan & zoom.** Drag to pan, scroll to zoom (or use the toolbar buttons), or
   type a region like `chr1:1,000-9,000`. Each move reloads just the new window.
 - **GTF annotation tracks.** Add any number of gene/transcript tracks from GTF
-  files; exons, CDS, and strand are drawn as a familiar gene model.
+  files (or preloaded polars DataFrames); exons, CDS, and strand are drawn as a
+  familiar gene model. Annotations are loaded into memory once and filtered per
+  view — GTFs are small and usually unindexed, so there's nothing to re-read.
 - **Lightweight by design.** Refuses to render windows larger than
   `max_window` (default 100 kb) and samples dense pileups down to `max_reads`
   (default 5000) so the browser never chokes. There's no whole-chromosome view.
@@ -64,6 +66,20 @@ viewer.region          # "chr1:1,000-9,000"
 viewer.chrom, viewer.start, viewer.end
 ```
 
+You can also pass an already-loaded annotation instead of a path — handy when
+you want to load it once and share it across viewers, or filter/transform it
+first:
+
+```python
+import polars_bio as pb
+
+genes = pb.read_gtf("genes.gtf")          # whole annotation, in memory
+viewer = mo.ui.anywidget(
+    BamViewer("reads.sorted.bam", region="chr1:1,000-9,000",
+              gtf_tracks={"GENCODE": genes})
+)
+```
+
 Drive it from Python (attribute access is proxied to the widget):
 
 ```python
@@ -84,13 +100,14 @@ BamViewer(
 
 ## How it works
 
-The Python side holds the view region as synced traitlets (`chrom`, `start`,
-`end`). When the frontend pans/zooms it writes the new region back to those
-traits; an observer reloads reads (`polars_bio.scan_bam(...).filter(region)`)
-and GTF features (`scan_gtf`), packs them into non-overlapping rows, and pushes
-the result to the canvas. Contig lengths are read straight from the BAM header
-with the standard library (BGZF is gzip-compatible), so **pysam is not a runtime
-dependency**.
+The Python side holds the view region as a single synced traitlet
+(`[chrom, start, end]`, so each pan/zoom is one atomic reload). When the
+frontend pans/zooms it writes the new region back; an observer reloads reads
+(`polars_bio.scan_bam(...).filter(region)`, which uses the `.bai` index) and
+filters the preloaded GTF frame(s) in memory, packs everything into
+non-overlapping rows, and pushes the result to the canvas. Contig lengths are
+read straight from the BAM header with the standard library (BGZF is
+gzip-compatible), so **pysam is not a runtime dependency**.
 
 ## Development
 
@@ -105,8 +122,8 @@ the widget's reload logic.
 ## Limitations
 
 - No base-level / mismatch / coverage view (kept intentionally lean).
-- GTF files are scanned in full (they're small and unindexed); BAM access is
-  index-driven.
+- GTF tracks are held fully in memory (they're small and unindexed); BAM access
+  is index-driven and reads only the visible window.
 - No whole-chromosome overview by design — zoom in to a window of
   `max_window` bp or smaller.
 
