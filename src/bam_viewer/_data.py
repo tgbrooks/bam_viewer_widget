@@ -1,0 +1,269 @@
+"""Data access and layout helpers for the BAM viewer widget.
+
+All functions here are pure (no widget / UI state) so they can be unit tested
+on their own. Coordinates follow polars-bio's default convention: **1-based,
+closed** intervals (``start`` and ``end`` are both inclusive), which also
+matches the GTF convention so reads and annotations line up.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Optional
+
+import polars as pl
+import polars_bio as pb
+
+# CIGAR operations that consume the reference and so advance the genomic
+# position.  ``N`` (skipped region, e.g. an intron) also consumes the
+# reference but is rendered as a gap rather than an aligned block.
+_CIGAR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
+_REF_BLOCK_OPS = frozenset("M=XD")
+
+
+def cigar_blocks(start: int, cigar: Optional[str], end: int) -> list[list[int]]:
+    """Split an alignment into aligned blocks, breaking on ``N`` (introns).
+
+    ``start``/``end`` are 1-based inclusive.  Returns a list of
+    ``[block_start, block_end]`` pairs (also 1-based inclusive).  Reads without
+    usable CIGAR information collapse to a single ``[start, end]`` block.
+    """
+    if not cigar or cigar == "*":
+        return [[start, end]]
+
+    blocks: list[list[int]] = []
+    pos = start
+    cur_start = start
+    cur_end = start - 1
+    matched = False
+    for length, op in _CIGAR_RE.findall(cigar):
+        matched = True
+        length = int(length)
+        if op in _REF_BLOCK_OPS:
+            cur_end = pos + length - 1
+            pos += length
+        elif op == "N":
+            if cur_end >= cur_start:
+                blocks.append([cur_start, cur_end])
+            pos += length
+            cur_start = pos
+            cur_end = pos - 1
+        # I, S, H, P do not consume the reference.
+    if cur_end >= cur_start:
+        blocks.append([cur_start, cur_end])
+    if not matched or not blocks:
+        return [[start, end]]
+    return blocks
+
+
+def pack_intervals(items: list[dict], gap: int) -> int:
+    """Greedily assign each item a ``row`` so rows contain no overlaps.
+
+    ``items`` must be sorted by ``start``.  Two items share a row only if a gap
+    of at least ``gap`` base pairs separates them.  Mutates each item in place
+    adding an integer ``row`` key and returns the number of rows used.
+    """
+    row_last_end: list[int] = []
+    for it in items:
+        placed = False
+        for i, last_end in enumerate(row_last_end):
+            if it["start"] > last_end + gap:
+                row_last_end[i] = it["end"]
+                it["row"] = i
+                placed = True
+                break
+        if not placed:
+            it["row"] = len(row_last_end)
+            row_last_end.append(it["end"])
+    return len(row_last_end)
+
+
+def query_reads(
+    bam_path: str,
+    chrom: str,
+    start: int,
+    end: int,
+    *,
+    max_reads: int = 5000,
+) -> dict:
+    """Load and lay out reads overlapping ``chrom:start-end`` from a BAM file.
+
+    Only the requested region is read from disk: polars-bio uses the ``.bai``
+    index for predicate pushdown, so the cost scales with the window, not the
+    file.  Returns a JSON-serialisable dict describing the reads and layout.
+    """
+    lf = pb.scan_bam(bam_path)
+    df = lf.filter(
+        (pl.col("chrom") == chrom)
+        & (pl.col("end") >= start)
+        & (pl.col("start") <= end)
+    ).select(["start", "end", "flags", "cigar", "mapping_quality"])
+
+    df = df.collect()
+    total = df.height
+    truncated = total > max_reads
+    if truncated:
+        # Protect the browser from pathological pileups by sampling down to a
+        # representative subset rather than refusing outright.
+        df = df.sample(n=max_reads, seed=0)
+
+    reads: list[dict] = []
+    for row in df.iter_rows(named=True):
+        r_start = int(row["start"])
+        r_end = int(row["end"])
+        blocks = cigar_blocks(r_start, row["cigar"], r_end)
+        read = {
+            "start": r_start,
+            "end": r_end,
+            "strand": "-" if (int(row["flags"]) & 0x10) else "+",
+            "mapq": int(row["mapping_quality"]),
+        }
+        # Only ship blocks when the read is actually spliced; otherwise the
+        # frontend draws a single rectangle from start..end.
+        if len(blocks) > 1:
+            read["blocks"] = blocks
+        reads.append(read)
+
+    reads.sort(key=lambda r: r["start"])
+    gap = max(1, (end - start) // 300)
+    n_rows = pack_intervals(reads, gap)
+
+    return {
+        "reads": reads,
+        "n_rows": n_rows,
+        "total": total,
+        "shown": len(reads),
+        "truncated": truncated,
+    }
+
+
+# GTF feature types we care about for a lightweight gene model.
+_EXONIC = frozenset({"exon"})
+_CDS = frozenset({"CDS"})
+_SPAN_TYPES = frozenset({"transcript", "mRNA", "gene"})
+
+
+def query_features(
+    gtf_path: str,
+    chrom: str,
+    start: int,
+    end: int,
+    *,
+    max_features: int = 2000,
+) -> dict:
+    """Load GTF features overlapping ``chrom:start-end`` as transcript models.
+
+    GTF files are not indexed, so the whole file is scanned, but annotation
+    files are small and the scan is lazy + filtered.  Features are grouped by
+    ``transcript_id`` into models carrying their exon (and CDS) blocks so the
+    frontend can draw a familiar exon/intron gene track.
+    """
+    attr_fields = ["gene_id", "transcript_id", "gene_name"]
+    lf = pb.scan_gtf(gtf_path, attr_fields=attr_fields)
+    df = lf.filter(
+        (pl.col("chrom") == chrom)
+        & (pl.col("end") >= start)
+        & (pl.col("start") <= end)
+    ).select(["start", "end", "type", "strand", *attr_fields])
+    df = df.collect()
+
+    # Group rows into transcript models keyed by transcript_id. Bare gene-span
+    # rows are tracked separately and only kept when no transcript represents
+    # that gene, so a GENCODE-style file shows its transcripts (with exons)
+    # while a gene-only file still shows something.
+    models: dict[str, dict] = {}
+    gene_spans: dict[str, dict] = {}
+    other: list[dict] = []
+
+    for row in df.iter_rows(named=True):
+        s, e = int(row["start"]), int(row["end"])
+        ftype = row["type"]
+        tid = row["transcript_id"]
+        gid = row["gene_id"]
+        label = row["gene_name"] or gid or tid or ftype
+        strand = row["strand"] or "."
+
+        if tid is None:
+            span = {"start": s, "end": e, "strand": strand,
+                    "name": label, "gene_id": gid, "exons": [], "cds": []}
+            if ftype in _SPAN_TYPES:
+                # Collapse duplicate gene lines for the same gene_id.
+                key = gid or label
+                prev = gene_spans.get(key)
+                if prev is None:
+                    gene_spans[key] = span
+                else:
+                    prev["start"] = min(prev["start"], s)
+                    prev["end"] = max(prev["end"], e)
+            elif ftype not in _EXONIC | _CDS:
+                other.append(span)
+            continue
+
+        m = models.get(tid)
+        if m is None:
+            m = models[tid] = {
+                "start": s, "end": e, "strand": strand,
+                "name": label, "gene_id": gid, "exons": [], "cds": [],
+            }
+        m["start"] = min(m["start"], s)
+        m["end"] = max(m["end"], e)
+        # Prefer a real gene_name; never let a bare gene_id clobber one.
+        if row["gene_name"]:
+            m["name"] = row["gene_name"]
+        if gid:
+            m["gene_id"] = gid
+        if strand != ".":
+            m["strand"] = strand
+        if ftype in _EXONIC:
+            m["exons"].append([s, e])
+        elif ftype in _CDS:
+            m["cds"].append([s, e])
+
+    transcript_gene_ids = {m["gene_id"] for m in models.values()}
+    orphan_genes = [
+        g for g in gene_spans.values() if g["gene_id"] not in transcript_gene_ids
+    ]
+    features = list(models.values()) + orphan_genes + other
+    for f in features:
+        f["exons"].sort()
+        f["cds"].sort()
+    features.sort(key=lambda f: f["start"])
+
+    total = len(features)
+    truncated = total > max_features
+    if truncated:
+        features = features[:max_features]
+
+    gap = max(1, (end - start) // 200)
+    n_rows = pack_intervals(features, gap)
+
+    return {
+        "features": features,
+        "n_rows": n_rows,
+        "total": total,
+        "truncated": truncated,
+    }
+
+
+_REGION_RE = re.compile(
+    r"^\s*([^:\s]+)\s*(?::\s*([\d,]+)\s*-\s*([\d,]+))?\s*$"
+)
+
+
+def parse_region(region: str) -> tuple[str, Optional[int], Optional[int]]:
+    """Parse ``chrom``, ``chrom:start-end`` (commas allowed) into a tuple.
+
+    Returns ``(chrom, start, end)`` with ``start``/``end`` as ``None`` when the
+    string is just a contig name.  Raises ``ValueError`` on malformed input.
+    """
+    m = _REGION_RE.match(region)
+    if not m:
+        raise ValueError(f"Could not parse region: {region!r}")
+    chrom = m.group(1)
+    if m.group(2) is None:
+        return chrom, None, None
+    start = int(m.group(2).replace(",", ""))
+    end = int(m.group(3).replace(",", ""))
+    if end < start:
+        start, end = end, start
+    return chrom, start, end

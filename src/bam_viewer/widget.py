@@ -1,0 +1,213 @@
+"""An embeddable anywidget for browsing a local BAM file in marimo.
+
+Reads (and optional GTF annotation tracks) are loaded lazily with polars-bio:
+only the visible window is read from disk via the ``.bai`` index, so the widget
+stays responsive even on large files.  The frontend (``static/index.js``)
+handles pan/zoom and asks Python to reload data whenever the view moves.
+"""
+
+from __future__ import annotations
+
+import gzip
+import pathlib
+import struct
+import traceback
+from typing import Mapping, Optional, Union
+
+import anywidget
+import traitlets
+
+from . import _data
+
+_STATIC = pathlib.Path(__file__).parent / "static"
+
+_EMPTY_READS = {"reads": [], "n_rows": 0, "total": 0, "shown": 0, "truncated": False}
+
+
+def _read_bam_contigs(path: str) -> dict[str, int]:
+    """Return ``{contig_name: length}`` from a BAM header.
+
+    BGZF is gzip-compatible, so the header parses with the stdlib alone — no
+    pysam dependency.  Returns an empty dict if the header can't be read.
+    """
+    try:
+        with gzip.open(path, "rb") as f:
+            if f.read(4) != b"BAM\x01":
+                return {}
+            (l_text,) = struct.unpack("<i", f.read(4))
+            f.read(l_text)
+            (n_ref,) = struct.unpack("<i", f.read(4))
+            contigs: dict[str, int] = {}
+            for _ in range(n_ref):
+                (l_name,) = struct.unpack("<i", f.read(4))
+                name = f.read(l_name)[:-1].decode()
+                (l_ref,) = struct.unpack("<i", f.read(4))
+                contigs[name] = l_ref
+            return contigs
+    except (OSError, struct.error, UnicodeDecodeError):
+        return {}
+
+
+class BamViewer(anywidget.AnyWidget):
+    """Display aligned reads from an indexed BAM file with GTF annotations.
+
+    Parameters
+    ----------
+    bam_path:
+        Path to a coordinate-sorted, indexed BAM file. The index is expected at
+        ``<bam_path>.bai``.
+    region:
+        Initial view as ``"chrom:start-end"`` (1-based, commas allowed) or just
+        ``"chrom"`` to start at the contig's beginning.
+    gtf_tracks:
+        Optional mapping of ``{track_name: gtf_path}`` rendered as gene tracks.
+    max_window:
+        Largest window (in bp) that will be rendered. Zooming out past this
+        shows a "zoom in" message instead of loading data.
+    max_reads:
+        Reads are sampled down to this many before being sent to the browser.
+
+    Wrap the instance in ``marimo.ui.anywidget(...)`` to embed it in a notebook.
+    """
+
+    _esm = _STATIC / "index.js"
+    _css = _STATIC / "style.css"
+
+    # --- configuration (set once from Python) ---------------------------------
+    bam_path = traitlets.Unicode().tag(sync=True)
+    max_window = traitlets.Int(100_000).tag(sync=True)
+    max_reads = traitlets.Int(5000).tag(sync=True)
+    track_names = traitlets.List(traitlets.Unicode()).tag(sync=True)
+    contigs = traitlets.Dict().tag(sync=True)
+
+    # --- view region: a single [chrom, start, end] trait so a pan/zoom is one
+    #     atomic update (and therefore exactly one reload), not three. ----------
+    _view = traitlets.List().tag(sync=True)
+
+    # --- data pushed to the frontend ------------------------------------------
+    _read_data = traitlets.Dict().tag(sync=True)
+    _feature_data = traitlets.List().tag(sync=True)
+    _message = traitlets.Unicode("").tag(sync=True)
+    _loading = traitlets.Bool(False).tag(sync=True)
+
+    def __init__(
+        self,
+        bam_path: Union[str, pathlib.Path],
+        region: Optional[str] = None,
+        gtf_tracks: Optional[Mapping[str, Union[str, pathlib.Path]]] = None,
+        *,
+        max_window: int = 100_000,
+        max_reads: int = 5000,
+        **kwargs,
+    ):
+        bam_path = str(bam_path)
+        if not pathlib.Path(bam_path).exists():
+            raise FileNotFoundError(bam_path)
+        index = pathlib.Path(bam_path + ".bai")
+        if not index.exists():
+            raise FileNotFoundError(
+                f"BAM index not found: {index}. The BAM must be sorted and "
+                f"indexed (e.g. `samtools index {bam_path}`)."
+            )
+
+        self._gtf_tracks = {
+            name: str(path) for name, path in (gtf_tracks or {}).items()
+        }
+        contigs = _read_bam_contigs(bam_path)
+        chrom, start, end = self._initial_region(region, contigs)
+
+        # Suppress the reload while the initial traits are assigned; we do a
+        # single explicit reload at the end of __init__ instead.
+        self._suspend_reload = True
+        super().__init__(
+            bam_path=bam_path,
+            max_window=max_window,
+            max_reads=max_reads,
+            track_names=list(self._gtf_tracks),
+            contigs=contigs,
+            _view=[chrom, start, end],
+            **kwargs,
+        )
+        self._suspend_reload = False
+        self._reload()
+
+    @staticmethod
+    def _initial_region(
+        region: Optional[str], contigs: dict[str, int]
+    ) -> tuple[str, int, int]:
+        if region:
+            chrom, start, end = _data.parse_region(region)
+        elif contigs:
+            chrom, start, end = next(iter(contigs)), None, None
+        else:
+            raise ValueError(
+                "No region given and contigs could not be read from the BAM "
+                "header; pass region='chrom:start-end'."
+            )
+        if start is None or end is None:
+            length = contigs.get(chrom, 10_000)
+            start, end = 1, min(length, 10_000)
+        return chrom, int(start), int(end)
+
+    # --- reactivity -----------------------------------------------------------
+    @traitlets.observe("_view")
+    def _on_view_change(self, _change):
+        if not getattr(self, "_suspend_reload", False):
+            self._reload()
+
+    def _reload(self):
+        """Load reads + features for the current window and push to frontend."""
+        chrom, start, end = self._view
+        start, end = int(start), int(end)
+        if end < start:
+            start, end = end, start
+        width = end - start + 1
+
+        if width > self.max_window:
+            self._message = (
+                f"Window too large ({width:,} bp). Zoom in to "
+                f"≤ {self.max_window:,} bp to view reads."
+            )
+            self._read_data = dict(_EMPTY_READS)
+            self._feature_data = []
+            return
+
+        self._loading = True
+        try:
+            self._read_data = _data.query_reads(
+                self.bam_path, chrom, start, end, max_reads=self.max_reads
+            )
+            self._feature_data = [
+                {"name": name, **_data.query_features(path, chrom, start, end)}
+                for name, path in self._gtf_tracks.items()
+            ]
+            self._message = ""
+        except Exception:  # surface load errors in the widget, don't crash
+            self._message = "Error loading region:\n" + traceback.format_exc(limit=2)
+            self._read_data = dict(_EMPTY_READS)
+            self._feature_data = []
+        finally:
+            self._loading = False
+
+    # --- convenience API ------------------------------------------------------
+    @property
+    def chrom(self) -> str:
+        return self._view[0]
+
+    @property
+    def start(self) -> int:
+        return int(self._view[1])
+
+    @property
+    def end(self) -> int:
+        return int(self._view[2])
+
+    @property
+    def region(self) -> str:
+        """The current view as a ``chrom:start-end`` string."""
+        return f"{self.chrom}:{self.start:,}-{self.end:,}"
+
+    def goto(self, region: str) -> None:
+        """Jump the view to ``region`` (``"chrom:start-end"`` or ``"chrom"``)."""
+        chrom, start, end = self._initial_region(region, dict(self.contigs))
+        self._view = [chrom, start, end]  # fires the observer -> reload

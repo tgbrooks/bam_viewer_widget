@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bam-viewer-widget"
+version = "0.1.0"
+description = "An embeddable marimo widget for browsing reads of a local BAM file, with optional GTF annotation tracks."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "tgbrooks" }]
+keywords = ["bioinformatics", "bam", "marimo", "anywidget", "genomics", "igv"]
+dependencies = [
+    "anywidget>=0.9",
+    "polars-bio>=0.10",
+    "polars>=1.0",
+    "traitlets>=5.0",
+]
+
+[project.optional-dependencies]
+notebook = ["marimo>=0.9"]
+dev = ["pytest>=7", "pysam>=0.22", "marimo>=0.9"]
+
+[project.urls]
+Homepage = "https://github.com/tgbrooks/bam_viewer_widget"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bam_viewer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

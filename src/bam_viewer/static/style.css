@@ -1,0 +1,83 @@
+.bamv {
+  font-family: system-ui, -apple-system, sans-serif;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #fff;
+  color: #222;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.bamv-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  background: #f7f7f8;
+  border-bottom: 1px solid #e2e2e2;
+}
+
+.bamv-region {
+  flex: 1 1 auto;
+  min-width: 120px;
+  padding: 3px 6px;
+  font: 12px ui-monospace, monospace;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+.bamv-region.bamv-invalid {
+  border-color: #d04646;
+  background: #fff3f3;
+}
+
+.bamv-spacer { flex: 0 0 8px; }
+
+.bamv-btn {
+  padding: 3px 8px;
+  font-size: 13px;
+  line-height: 1;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+  color: #333;
+}
+.bamv-btn:hover { background: #eee; }
+.bamv-btn:active { background: #e0e0e0; }
+
+.bamv-canvas-wrap {
+  position: relative;
+  width: 100%;
+}
+
+.bamv-canvas { display: block; }
+
+.bamv-overlay {
+  position: absolute;
+  inset: 0;
+  cursor: grab;
+}
+.bamv-overlay.bamv-dragging { cursor: grabbing; }
+
+.bamv-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: rgba(30, 30, 30, 0.92);
+  color: #fff;
+  font: 11px system-ui, sans-serif;
+  padding: 4px 7px;
+  border-radius: 4px;
+  max-width: 200px;
+  z-index: 5;
+  line-height: 1.35;
+}
+
+.bamv-status {
+  padding: 4px 8px;
+  font: 11px system-ui, sans-serif;
+  color: #666;
+  background: #f7f7f8;
+  border-top: 1px solid #e2e2e2;
+  min-height: 14px;
+}
