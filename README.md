@@ -134,10 +134,12 @@ non-overlapping rows, and pushes the result to the canvas. Contig lengths are
 read straight from the BAM header with the standard library (BGZF is
 gzip-compatible), so **pysam is not a runtime dependency**.
 
-Selecting an isoform does *not* reload reads: Python just publishes the
-transcript's full exon list and the frontend recomputes each read's
-compatibility itself. Selection is therefore instant and can't race the read
-load.
+Selecting an isoform does *not* reload reads: the transcript's full exon list
+is attached to the (already-loaded) reads and the frontend recomputes each
+read's compatibility itself, so selection is instant. The `_read_data` and
+`_feature_data` payloads are version-stamped and the frontend ignores any
+out-of-date re-sync, which keeps reads and annotations from reverting on
+marimo builds (0.23.12+) that occasionally echo a stale trait value.
 
 ## Development
 

@@ -90,15 +90,15 @@ class BamViewer(anywidget.AnyWidget):
     #     atomic update (and therefore exactly one reload), not three. ----------
     _view = traitlets.List().tag(sync=True)
 
-    # --- selected isoform: {track, transcript_id} (empty = none), plus its full
-    #     exon list. The frontend judges each read's compatibility against these
-    #     exons itself, so selecting never re-queries reads (no reload race). ---
+    # --- selected isoform: {track, transcript_id} (empty = none). Its full exon
+    #     list rides along inside _read_data (see _reload) so it reaches the
+    #     frontend through the same reliably-synced channel as the reads; the
+    #     frontend judges each read's compatibility against those exons. --------
     _selected = traitlets.Dict().tag(sync=True)
-    _selected_exons = traitlets.List().tag(sync=True)
 
-    # --- data pushed to the frontend ------------------------------------------
+    # --- data pushed to the frontend (both version-stamped; see _publish_*) ---
     _read_data = traitlets.Dict().tag(sync=True)
-    _feature_data = traitlets.List().tag(sync=True)
+    _feature_data = traitlets.Dict().tag(sync=True)
     _message = traitlets.Unicode("").tag(sync=True)
     _loading = traitlets.Bool(False).tag(sync=True)
 
@@ -133,6 +133,7 @@ class BamViewer(anywidget.AnyWidget):
 
         # Suppress the reload while the initial traits are assigned; we do a
         # single explicit reload at the end of __init__ instead.
+        self._ver = 0
         self._suspend_reload = True
         super().__init__(
             bam_path=bam_path,
@@ -173,9 +174,11 @@ class BamViewer(anywidget.AnyWidget):
 
     @traitlets.observe("_selected")
     def _on_selection_change(self, _change):
-        # Publish the selected isoform's full exons; the frontend recomputes
-        # compatibility from these. No read reload -> no ordering race, instant.
-        self._selected_exons = self._compute_selected_exons()
+        # Re-publish the current reads with the newly selected isoform's exons
+        # attached (no BAM re-query — the reads are unchanged).
+        rd = dict(self._read_data)
+        rd["selected_exons"] = self._compute_selected_exons()
+        self._publish_reads(rd)
 
     def _compute_selected_exons(self):
         """Full exon list of the currently selected isoform ([] if none)."""
@@ -185,6 +188,22 @@ class BamViewer(anywidget.AnyWidget):
         if df is None or not tid:
             return []
         return _data.transcript_exons(df, tid)
+
+    def _next_version(self) -> int:
+        v = getattr(self, "_ver", 0) + 1
+        self._ver = v
+        return v
+
+    def _publish_reads(self, rd: dict) -> None:
+        # Stamp a monotonic version so the frontend can drop stale re-syncs.
+        # (Works around a marimo 0.23.12+ regression where a trait Python
+        # updates in response to a frontend change is clobbered by a stale echo.)
+        rd = dict(rd)
+        rd["_v"] = self._next_version()
+        self._read_data = rd
+
+    def _publish_features(self, tracks: list) -> None:
+        self._feature_data = {"_v": self._next_version(), "tracks": tracks}
 
     def _reload(self):
         """Load reads + features for the current window and push to frontend.
@@ -197,37 +216,40 @@ class BamViewer(anywidget.AnyWidget):
         if end < start:
             start, end = end, start
         width = end - start + 1
+        exons = self._compute_selected_exons()  # rides along in _read_data
 
         if width > self.max_annotation_window:
             self._message = (
                 f"Window too large ({width:,} bp). Zoom in to "
                 f"≤ {self.max_annotation_window:,} bp."
             )
-            self._read_data = dict(_EMPTY_READS)
-            self._feature_data = []
+            self._publish_reads({**_EMPTY_READS, "selected_exons": exons})
+            self._publish_features([])
             return
 
         self._loading = True
         try:
-            self._feature_data = [
+            self._publish_features([
                 {"name": name, **_data.query_features(df, chrom, start, end)}
                 for name, df in self._gtf_frames.items()
-            ]
+            ])
             if width > self.max_window:
                 # Too wide for reads, but annotations still render.
-                self._read_data = {
+                rd = {
                     **_EMPTY_READS,
                     "note": f"Zoom in to ≤ {self.max_window:,} bp to see reads.",
                 }
             else:
-                self._read_data = _data.query_reads(
+                rd = _data.query_reads(
                     self.bam_path, chrom, start, end, max_reads=self.max_reads
                 )
+            rd["selected_exons"] = exons
+            self._publish_reads(rd)
             self._message = ""
         except Exception:  # surface load errors in the widget, don't crash
             self._message = "Error loading region:\n" + traceback.format_exc(limit=2)
-            self._read_data = dict(_EMPTY_READS)
-            self._feature_data = []
+            self._publish_reads({**_EMPTY_READS, "selected_exons": exons})
+            self._publish_features([])
         finally:
             self._loading = False
 

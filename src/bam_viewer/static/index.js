@@ -115,8 +115,17 @@ function render({ model, el }) {
   // True while we are writing the region back to the model, so the resulting
   // change:* events don't re-enter and clobber our own view.
   let selfUpdating = false;
-  let readsScrollY = 0; // vertical scroll offset within the alignments track
-  let scrollbar = null; // geometry of the reads scrollbar (or null)
+  let contentScrollY = 0; // vertical scroll offset of the content band
+  let scrollbar = null; // geometry of the content scrollbar (or null)
+
+  // Version-guarded snapshots of the data traits. marimo (>=0.23.12) can
+  // re-send a *stale* value of a trait after Python has already updated it in
+  // response to a frontend change; we keep the newest version we've seen and
+  // ignore any older re-sync so reads/annotations never revert.
+  let readState = model.get("_read_data") || { reads: [], n_rows: 0 };
+  let featureState = (model.get("_feature_data") || {}).tracks || [];
+  let lastReadV = readState._v ?? -1;
+  let lastFeatV = (model.get("_feature_data") || {})._v ?? -1;
 
   const plotLeft = () => 8;
   const plotWidth = () => Math.max(10, canvas.clientWidth - 16);
@@ -134,12 +143,7 @@ function render({ model, el }) {
     return c[view.chrom] || Infinity;
   }
 
-  // Is an isoform with a known exon model currently selected? Does this feature
-  // match it?
-  function selectionActive() {
-    const ex = model.get("_selected_exons") || [];
-    return ex.length > 0;
-  }
+  // Does this feature match the current selection (for highlighting)?
   function isSelected(trackName, f) {
     const s = model.get("_selected") || {};
     return (
@@ -279,16 +283,17 @@ function render({ model, el }) {
     hitFeats.push({ x0, x1, y0: y, y1: y + FEAT_ROW_H, f, track: trackName });
   }
 
-  function drawReads(data, regionTop, regionHeight, scrollY) {
-    hitReads = [];
-    const firstRow = Math.floor(scrollY / READ_ROW_H) - 1;
-    const lastRow = Math.ceil((scrollY + regionHeight) / READ_ROW_H);
+  // Draw the read rows visible in the screen band [clipTop, clipBottom].
+  // `rowsTop` is the screen y of read row 0 (already scroll-adjusted).
+  function drawReads(data, rowsTop, clipTop, clipBottom) {
+    const first = Math.max(0, Math.floor((clipTop - rowsTop) / READ_ROW_H) - 1);
+    const last = Math.ceil((clipBottom - rowsTop) / READ_ROW_H) + 1;
     const pw = plotWidth();
-    const exons = model.get("_selected_exons") || [];
+    const exons = data.selected_exons || [];
     const selecting = exons.length > 0;
     for (const r of data.reads) {
-      if (r.row < firstRow || r.row > lastRow) continue;
-      const y = regionTop + r.row * READ_ROW_H - scrollY;
+      if (r.row < first || r.row > last) continue;
+      const y = rowsTop + r.row * READ_ROW_H;
       const blocks = r.blocks || [[r.start, r.end]];
       const x0all = bpToPx(r.start);
       const x1all = bpToPx(r.end + 1);
@@ -330,74 +335,102 @@ function render({ model, el }) {
     }
   }
 
-  // Vertical scrollbar for the alignments track; also records geometry for the
-  // pointer handlers. Returns nothing but sets the module-level `scrollbar`.
-  function drawScrollbar(top, avail, contentH) {
-    const maxScroll = Math.max(0, contentH - avail);
+  // Vertical scrollbar for the scrollable content band; also records geometry
+  // for the pointer handlers. Sets the module-level `scrollbar` (or null).
+  function drawScrollbar(top, height, contentH) {
+    const maxScroll = Math.max(0, contentH - height);
     if (maxScroll <= 0) {
       scrollbar = null;
       return;
     }
     const x = canvas.clientWidth - 7;
-    const thumbH = Math.max(24, (avail / contentH) * avail);
-    const thumbY = top + (readsScrollY / maxScroll) * (avail - thumbH);
+    const thumbH = Math.max(24, (height / contentH) * height);
+    const thumbY = top + (contentScrollY / maxScroll) * (height - thumbH);
     ctx.fillStyle = "rgba(0,0,0,0.05)";
-    ctx.fillRect(x, top, 5, avail);
+    ctx.fillRect(x, top, 5, height);
     ctx.fillStyle = "rgba(0,0,0,0.28)";
     ctx.fillRect(x, thumbY, 5, thumbH);
-    scrollbar = { x, top, avail, thumbY, thumbH, maxScroll };
+    scrollbar = { x, top, avail: height, thumbY, thumbH, maxScroll };
   }
 
+  // Everything below the ruler (annotation tracks + the alignments track) lives
+  // in one vertically-scrollable band, so dense annotations can never squeeze
+  // the reads out of existence — you just scroll down to them.
   function draw() {
+    try {
+      drawImpl();
+    } catch (err) {
+      // A bad frame must never wedge the widget's update stream.
+      console.error("bam_viewer draw error:", err);
+    }
+  }
+
+  function drawImpl() {
     setupCanvas();
     hitFeats = [];
+    hitReads = [];
+    scrollbar = null;
     ctx.clearRect(0, 0, canvas.clientWidth, VIEW_H);
     drawRuler();
 
+    const readData = readState;
     const message = model.get("_message");
-    let y = RULER_H + 4;
-    const feats = model.get("_feature_data") || [];
-    for (const track of feats) {
-      ctx.fillStyle = COLORS.axis;
-      ctx.font = "bold 11px system-ui, sans-serif";
-      const note = track.truncated ? " (truncated)" : "";
-      ctx.fillText(`▸ ${track.name}${note}`, plotLeft(), y + 11);
-      y += TRACK_HEADER_H;
-      const rows = Math.max(1, track.n_rows || 0);
-      for (const f of track.features || []) drawFeature(f, y, track.name);
-      y += rows * FEAT_ROW_H + SECTION_GAP;
-    }
-
-    const readData = model.get("_read_data") || { reads: [], n_rows: 0 };
-    ctx.fillStyle = COLORS.axis;
-    ctx.font = "bold 11px system-ui, sans-serif";
-    ctx.fillText("▸ Alignments", plotLeft(), y + 11);
-    y += TRACK_HEADER_H;
-    const avail = VIEW_H - y - 2;
-    scrollbar = null;
-
     if (message) {
       ctx.fillStyle = "#9a6a00";
       ctx.font = "12px system-ui, sans-serif";
       message.split("\n").forEach((line, i) => {
-        ctx.fillText(line, plotLeft(), y + 16 + i * 15);
+        ctx.fillText(line, plotLeft(), RULER_H + 20 + i * 15);
       });
-    } else if (readData.note) {
-      // Reads not loaded (window wider than max_window) but annotations shown.
+      updateStatus(readData);
+      return;
+    }
+
+    // Lay everything out in content space (y = 0 just below the ruler).
+    const feats = featureState;
+    const layout = [];
+    let cy = 4;
+    for (const track of feats) {
+      const rows = Math.max(1, track.n_rows || 0);
+      layout.push({ track, headerY: cy, rowsY: cy + TRACK_HEADER_H });
+      cy += TRACK_HEADER_H + rows * FEAT_ROW_H + SECTION_GAP;
+    }
+    const readsHeaderY = cy;
+    const readsRowsY = cy + TRACK_HEADER_H;
+    const note = readData.note;
+    const readsH = note ? 22 : (readData.n_rows || 0) * READ_ROW_H;
+    const contentHeight = readsRowsY + readsH;
+
+    const scrollTop = RULER_H;
+    const scrollH = VIEW_H - scrollTop;
+    contentScrollY = clamp(contentScrollY, 0, Math.max(0, contentHeight - scrollH));
+    const off = scrollTop - contentScrollY; // content y -> screen y
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, scrollTop, canvas.clientWidth, scrollH);
+    ctx.clip();
+
+    for (const { track, headerY, rowsY } of layout) {
+      ctx.fillStyle = COLORS.axis;
+      ctx.font = "bold 11px system-ui, sans-serif";
+      const tnote = track.truncated ? " (truncated)" : "";
+      ctx.fillText(`▸ ${track.name}${tnote}`, plotLeft(), off + headerY + 11);
+      for (const f of track.features || []) drawFeature(f, off + rowsY, track.name);
+    }
+
+    ctx.fillStyle = COLORS.axis;
+    ctx.font = "bold 11px system-ui, sans-serif";
+    ctx.fillText("▸ Alignments", plotLeft(), off + readsHeaderY + 11);
+    if (note) {
       ctx.fillStyle = "#9a6a00";
       ctx.font = "12px system-ui, sans-serif";
-      ctx.fillText(readData.note, plotLeft(), y + 16);
+      ctx.fillText(note, plotLeft(), off + readsRowsY + 14);
     } else {
-      const contentH = (readData.n_rows || 0) * READ_ROW_H;
-      readsScrollY = clamp(readsScrollY, 0, Math.max(0, contentH - avail));
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(0, y, canvas.clientWidth, avail);
-      ctx.clip();
-      drawReads(readData, y, avail, readsScrollY);
-      ctx.restore();
-      drawScrollbar(y, avail, contentH);
+      drawReads(readData, off + readsRowsY, scrollTop, VIEW_H);
     }
+    ctx.restore();
+
+    drawScrollbar(scrollTop, scrollH, contentHeight);
     updateStatus(readData);
   }
 
@@ -410,7 +443,7 @@ function render({ model, el }) {
       txt += `${readData.shown || 0} reads`;
       if (readData.truncated) txt += ` (sampled from ${readData.total})`;
       const sel = model.get("_selected") || {};
-      const exons = model.get("_selected_exons") || [];
+      const exons = readData.selected_exons || [];
       const reads = readData.reads || [];
       if (sel.transcript_id && exons.length && reads.length) {
         let compat = 0;
@@ -460,10 +493,10 @@ function render({ model, el }) {
         const frac =
           (oy - scrollbar.top - scrollbar.thumbH / 2) /
           (scrollbar.avail - scrollbar.thumbH);
-        readsScrollY = clamp(frac * scrollbar.maxScroll, 0, scrollbar.maxScroll);
+        contentScrollY = clamp(frac * scrollbar.maxScroll, 0, scrollbar.maxScroll);
         draw();
       }
-      scrollDrag = { startOy: oy, startScroll: readsScrollY, sb: scrollbar };
+      scrollDrag = { startOy: oy, startScroll: contentScrollY, sb: scrollbar };
       return;
     }
     drag = {
@@ -482,7 +515,7 @@ function render({ model, el }) {
       const rect = overlay.getBoundingClientRect();
       const dy = e.clientY - rect.top - scrollDrag.startOy;
       const range = scrollDrag.sb.avail - scrollDrag.sb.thumbH;
-      readsScrollY = clamp(
+      contentScrollY = clamp(
         scrollDrag.startScroll + (dy / range) * scrollDrag.sb.maxScroll,
         0,
         scrollDrag.sb.maxScroll
@@ -539,8 +572,8 @@ function render({ model, el }) {
       // Shift+wheel (or wheel while the reads overflow and Shift is held)
       // scrolls the alignments vertically instead of zooming.
       if (e.shiftKey && scrollbar) {
-        readsScrollY = clamp(
-          readsScrollY + e.deltaY,
+        contentScrollY = clamp(
+          contentScrollY + e.deltaY,
           0,
           scrollbar.maxScroll
         );
@@ -672,14 +705,22 @@ function render({ model, el }) {
     }
   }
   model.on("change:_read_data", () => {
-    readsScrollY = 0; // start each freshly-loaded window at the top
+    const rd = model.get("_read_data") || {};
+    if (rd._v != null && rd._v <= lastReadV) return; // stale re-sync, ignore
+    if (rd._v != null) lastReadV = rd._v;
+    readState = rd;
     draw();
   });
-  model.on("change:_feature_data", draw);
+  model.on("change:_feature_data", () => {
+    const fd = model.get("_feature_data") || {};
+    if (fd._v != null && fd._v <= lastFeatV) return; // stale re-sync, ignore
+    if (fd._v != null) lastFeatV = fd._v;
+    featureState = fd.tracks || [];
+    draw();
+  });
   model.on("change:_selected", draw);
-  model.on("change:_selected_exons", draw);
   model.on("change:_message", draw);
-  model.on("change:_loading", () => updateStatus(model.get("_read_data") || {}));
+  model.on("change:_loading", () => updateStatus(readState));
   model.on("change:_view", onRegionTrait);
 
   const ro = new ResizeObserver(() => draw());

@@ -76,18 +76,18 @@ def test_query_reads_with_selection(bam_path, gtf_path):
 
 
 def test_widget_selection_publishes_exons(bam_path, gtf_path):
-    # Selecting an isoform publishes its full exon list (the frontend judges
-    # compatibility from that); it must not re-query or alter the reads.
+    # Selecting an isoform attaches its full exon list to _read_data (the
+    # frontend judges compatibility from that) without re-querying the reads.
     w = BamViewer(bam_path, region="chr1:1,000-9,000", gtf_tracks={"genes": gtf_path})
-    assert w._selected_exons == []
+    assert w._read_data.get("selected_exons") == []
     reads_before = w._read_data["reads"]
     w.select_transcript("T1")
     assert w.selected_transcript == "T1"
-    assert w._selected_exons == [[1000, 2000], [5000, 6000], [8000, 9000]]
+    assert w._read_data["selected_exons"] == [[1000, 2000], [5000, 6000], [8000, 9000]]
     assert w._read_data["reads"] is reads_before  # reads untouched, no reload
     w.clear_selection()
     assert w.selected_transcript is None
-    assert w._selected_exons == []
+    assert w._read_data["selected_exons"] == []
 
 
 def test_transcript_exons_cds_only(tmp_path):
@@ -225,13 +225,13 @@ def test_widget_construction_and_reload(bam_path, gtf_path):
     assert w.chrom == "chr1"
     assert w.start == 20_000 and w.end == 21_000
     assert w._read_data["shown"] > 0
-    assert len(w._feature_data) == 1
+    assert len(w._feature_data["tracks"]) == 1
     assert w._message == ""
 
     # Changing the region triggers an automatic reload via the observer.
     w._view = ["chr1", 1, 9000]
     assert w._read_data["shown"] > 0
-    assert w._feature_data[0]["features"], "GTF features should load in gene region"
+    assert w._feature_data["tracks"][0]["features"], "GTF features should load"
 
 
 def test_widget_reads_window_vs_annotation_window(bam_path, gtf_path):
@@ -244,13 +244,13 @@ def test_widget_reads_window_vs_annotation_window(bam_path, gtf_path):
     assert w._message == ""
     assert w._read_data["reads"] == []
     assert "note" in w._read_data and "zoom in" in w._read_data["note"].lower()
-    assert w._feature_data[0]["features"]  # annotations still present
+    assert w._feature_data["tracks"][0]["features"]  # annotations still present
 
     # Beyond max_annotation_window: nothing renders, a message explains why.
     w.goto("chr1:1-100,000")
     assert "too large" in w._message.lower()
     assert w._read_data["reads"] == []
-    assert w._feature_data == []
+    assert w._feature_data["tracks"] == []
 
 
 def test_widget_goto(bam_path):
