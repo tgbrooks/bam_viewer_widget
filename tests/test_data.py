@@ -78,6 +78,7 @@ def test_query_features(gtf_path):
     t = transcripts[0]
     assert t["name"] == "GeneOne"
     assert t["strand"] == "+"
+    assert t["transcript_id"] == "T1"
     assert [1000, 2000] in t["exons"]
     assert t["cds"] == [[5000, 6000]]
 

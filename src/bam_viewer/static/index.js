@@ -439,6 +439,7 @@ function render({ model, el }) {
         if (x >= h.x0 - 2 && x <= h.x1 + 2 && yy >= h.y0 && yy <= h.y1) {
           const f = h.f;
           hit = `<b>${f.name || "feature"}</b><br>${view.chrom}:${fmtBp(f.start)}-${fmtBp(f.end)} (${f.strand})`;
+          if (f.transcript_id) hit += `<br>transcript ${f.transcript_id}`;
           break;
         }
       }

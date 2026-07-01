@@ -247,8 +247,8 @@ def query_features(
         strand = row["strand"] or "."
 
         if tid is None:
-            span = {"start": s, "end": e, "strand": strand,
-                    "name": label, "gene_id": gid, "exons": [], "cds": []}
+            span = {"start": s, "end": e, "strand": strand, "name": label,
+                    "gene_id": gid, "transcript_id": None, "exons": [], "cds": []}
             if ftype in _SPAN_TYPES:
                 # Collapse duplicate gene lines for the same gene_id.
                 key = gid or label
@@ -265,8 +265,8 @@ def query_features(
         m = models.get(tid)
         if m is None:
             m = models[tid] = {
-                "start": s, "end": e, "strand": strand,
-                "name": label, "gene_id": gid, "exons": [], "cds": [],
+                "start": s, "end": e, "strand": strand, "name": label,
+                "gene_id": gid, "transcript_id": tid, "exons": [], "cds": [],
             }
         m["start"] = min(m["start"], s)
         m["end"] = max(m["end"], e)
