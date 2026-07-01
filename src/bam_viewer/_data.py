@@ -178,6 +178,25 @@ def query_reads(
 _EXONIC = frozenset({"exon"})
 _CDS = frozenset({"CDS"})
 _SPAN_TYPES = frozenset({"transcript", "mRNA", "gene"})
+# Sub-features that let us reconstruct exonic extent when a GTF has no explicit
+# ``exon`` lines (common in CDS-centric annotations).
+_UTR = frozenset({
+    "five_prime_utr", "three_prime_utr", "UTR",
+    "five_prime_UTR", "three_prime_UTR", "5UTR", "3UTR",
+})
+_CODON = frozenset({"start_codon", "stop_codon"})
+_EXONIC_FALLBACK = _CDS | _UTR | _CODON
+
+
+def _merge_blocks(blocks: list[list[int]]) -> list[list[int]]:
+    """Sort and merge touching/overlapping ``[start, end]`` intervals."""
+    merged: list[list[int]] = []
+    for s, e in sorted(blocks):
+        if merged and s <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return merged
 
 _GTF_CORE = ("chrom", "start", "end", "type", "strand")
 _GTF_ATTR_FIELDS = ("gene_id", "transcript_id", "gene_name")
@@ -191,20 +210,19 @@ def transcript_exons(gtf: pl.DataFrame, transcript_id: str) -> list[list[int]]:
     part of it is on screen.  Exons are 1-based inclusive, sorted, and merged
     where they touch or overlap.
     """
-    sub = gtf.filter(
-        (pl.col("transcript_id") == transcript_id)
-        & pl.col("type").is_in(list(_EXONIC))
-    ).select(["start", "end"])
+    sub = gtf.filter(pl.col("transcript_id") == transcript_id).select(
+        ["type", "start", "end"]
+    )
     if sub.height == 0:
         return []
-    raw = sorted([int(s), int(e)] for s, e in sub.iter_rows())
-    merged: list[list[int]] = []
-    for s, e in raw:
-        if merged and s <= merged[-1][1] + 1:
-            merged[-1][1] = max(merged[-1][1], e)
-        else:
-            merged.append([s, e])
-    return merged
+    exon, fallback = [], []
+    for t, s, e in sub.iter_rows():
+        if t in _EXONIC:
+            exon.append([int(s), int(e)])
+        elif t in _EXONIC_FALLBACK:
+            # Reconstruct exon extent from CDS/UTR when a GTF omits exon lines.
+            fallback.append([int(s), int(e)])
+    return _merge_blocks(exon or fallback)
 
 
 def _extract_attr(tag: str) -> pl.Expr:

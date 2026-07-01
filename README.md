@@ -25,10 +25,14 @@ itself.
   read is compatible when every aligned base falls inside the isoform's exons
   and every splice junction matches an annotated one. The full transcript is
   used for the test even when only part of it is on screen.
-- **Lightweight by design.** Refuses to render windows larger than
-  `max_window` (default 100 kb) and samples dense pileups down to `max_reads`
-  (default 5000) so the browser never chokes. There's no whole-chromosome view.
-- **Spliced reads.** `N` CIGAR operations (introns) are drawn as gaps.
+- **Lightweight by design.** Reads render for windows up to `max_window`
+  (default 300 kb) and dense pileups are sampled down to `max_reads`
+  (default 5000); annotations render for larger windows, up to
+  `max_annotation_window` (default 1 Mb). Beyond that the widget asks you to
+  zoom in. There's no whole-chromosome view.
+- **Scroll & spliced reads.** When more read rows are stacked than fit, drag the
+  scrollbar (or Shift+wheel) to scroll the alignments vertically. `N` CIGAR
+  operations (introns) are drawn as gaps.
 
 ## Install
 
@@ -112,9 +116,10 @@ GTF), so it stays correct even when the isoform runs off the edge of the view.
 BamViewer(
     bam_path,                 # path to a sorted, indexed BAM
     region="chr1:1000-9000",  # initial view; "chrom" alone starts at its 5' end
-    gtf_tracks={"name": path},# optional annotation tracks
-    max_window=100_000,       # largest window (bp) that will render
-    max_reads=5000,           # pileups are sampled down to this many reads
+    gtf_tracks={"name": path},   # optional annotation tracks
+    max_window=300_000,          # largest window (bp) that renders reads
+    max_annotation_window=1_000_000,  # largest window that renders annotations
+    max_reads=5000,              # pileups are sampled down to this many reads
 )
 ```
 
@@ -128,6 +133,11 @@ filters the preloaded GTF frame(s) in memory, packs everything into
 non-overlapping rows, and pushes the result to the canvas. Contig lengths are
 read straight from the BAM header with the standard library (BGZF is
 gzip-compatible), so **pysam is not a runtime dependency**.
+
+Selecting an isoform does *not* reload reads: Python just publishes the
+transcript's full exon list and the frontend recomputes each read's
+compatibility itself. Selection is therefore instant and can't race the read
+load.
 
 ## Development
 
@@ -144,8 +154,8 @@ the widget's reload logic.
 - No base-level / mismatch / coverage view (kept intentionally lean).
 - GTF tracks are held fully in memory (they're small and unindexed); BAM access
   is index-driven and reads only the visible window.
-- No whole-chromosome overview by design — zoom in to a window of
-  `max_window` bp or smaller.
+- No whole-chromosome overview by design — reads render up to `max_window`,
+  annotations up to `max_annotation_window`.
 
 ## License
 

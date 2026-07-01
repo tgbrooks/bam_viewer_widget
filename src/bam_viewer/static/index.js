@@ -47,6 +47,36 @@ function fmtBp(n) {
   return Math.round(n).toLocaleString("en-US");
 }
 
+// Mirror of _data.read_compatible: are a read's aligned blocks compatible with
+// an isoform's exon list? Every base must fall inside an exon and every splice
+// junction must match an annotated one. Computed on the frontend so selecting
+// an isoform never re-queries reads.
+function readCompatible(blocks, exons) {
+  const n = blocks.length;
+  if (n === 0 || !exons || !exons.length) return false;
+  const b0 = blocks[0][0];
+  let j = -1;
+  for (let i = 0; i < exons.length; i++) {
+    if (exons[i][0] <= b0 && b0 <= exons[i][1]) {
+      j = i;
+      break;
+    }
+  }
+  if (j === -1) return false;
+  for (let i = 0; i < n; i++) {
+    if (j >= exons.length) return false;
+    const bs = blocks[i][0];
+    const be = blocks[i][1];
+    const es = exons[j][0];
+    const ee = exons[j][1];
+    if (bs < es || be > ee) return false;
+    if (i > 0 && bs !== es) return false;
+    if (i < n - 1 && be !== ee) return false;
+    j++;
+  }
+  return true;
+}
+
 function render({ model, el }) {
   el.classList.add("bamv");
   el.innerHTML = `
@@ -85,6 +115,8 @@ function render({ model, el }) {
   // True while we are writing the region back to the model, so the resulting
   // change:* events don't re-enter and clobber our own view.
   let selfUpdating = false;
+  let readsScrollY = 0; // vertical scroll offset within the alignments track
+  let scrollbar = null; // geometry of the reads scrollbar (or null)
 
   const plotLeft = () => 8;
   const plotWidth = () => Math.max(10, canvas.clientWidth - 16);
@@ -93,16 +125,20 @@ function render({ model, el }) {
     plotLeft() + ((bp - view.start) / width()) * plotWidth();
   const pxToBp = (px) =>
     view.start + ((px - plotLeft()) / plotWidth()) * width();
+  // Widest window we allow zooming out to: where even annotations stop drawing.
+  const maxWidth = () =>
+    Math.max(MIN_WIDTH, model.get("max_annotation_window") || 50 * model.get("max_window"));
 
   function contigLen() {
     const c = model.get("contigs") || {};
     return c[view.chrom] || Infinity;
   }
 
-  // Is an isoform currently selected? Does this feature match it?
+  // Is an isoform with a known exon model currently selected? Does this feature
+  // match it?
   function selectionActive() {
-    const s = model.get("_selected") || {};
-    return !!s.transcript_id;
+    const ex = model.get("_selected_exons") || [];
+    return ex.length > 0;
   }
   function isSelected(trackName, f) {
     const s = model.get("_selected") || {};
@@ -115,11 +151,7 @@ function render({ model, el }) {
 
   // Snap the view to whole-bp integers and keep it inside the contig.
   function clampView() {
-    const w = clamp(
-      Math.round(width()),
-      MIN_WIDTH,
-      Math.max(MIN_WIDTH, 50 * model.get("max_window"))
-    );
+    const w = clamp(Math.round(width()), MIN_WIDTH, maxWidth());
     let s = Math.round(view.start);
     const maxLen = contigLen();
     if (isFinite(maxLen)) s = clamp(s, 1, Math.max(1, maxLen - w + 1));
@@ -247,14 +279,16 @@ function render({ model, el }) {
     hitFeats.push({ x0, x1, y0: y, y1: y + FEAT_ROW_H, f, track: trackName });
   }
 
-  function drawReads(data, top, avail) {
+  function drawReads(data, regionTop, regionHeight, scrollY) {
     hitReads = [];
-    const fitRows = Math.floor(avail / READ_ROW_H);
+    const firstRow = Math.floor(scrollY / READ_ROW_H) - 1;
+    const lastRow = Math.ceil((scrollY + regionHeight) / READ_ROW_H);
     const pw = plotWidth();
-    const selecting = selectionActive();
+    const exons = model.get("_selected_exons") || [];
+    const selecting = exons.length > 0;
     for (const r of data.reads) {
-      if (r.row >= fitRows) continue;
-      const y = top + r.row * READ_ROW_H;
+      if (r.row < firstRow || r.row > lastRow) continue;
+      const y = regionTop + r.row * READ_ROW_H - scrollY;
       const blocks = r.blocks || [[r.start, r.end]];
       const x0all = bpToPx(r.start);
       const x1all = bpToPx(r.end + 1);
@@ -263,7 +297,7 @@ function render({ model, el }) {
       // With an isoform selected, incompatible reads fade right out; otherwise
       // low mapping quality fades a little.
       ctx.globalAlpha = selecting
-        ? (r.compat ? 1 : FADED_ALPHA)
+        ? (readCompatible(blocks, exons) ? 1 : FADED_ALPHA)
         : (r.mapq <= 0 ? 0.35 : r.mapq < 10 ? 0.6 : 1);
       // Connector line across the whole read (covers intron gaps).
       ctx.strokeStyle = COLORS.intron;
@@ -294,7 +328,24 @@ function render({ model, el }) {
       ctx.globalAlpha = 1;
       hitReads.push({ x0: x0all, x1: x1all, y0: y, y1: y + READ_ROW_H, r });
     }
-    return fitRows;
+  }
+
+  // Vertical scrollbar for the alignments track; also records geometry for the
+  // pointer handlers. Returns nothing but sets the module-level `scrollbar`.
+  function drawScrollbar(top, avail, contentH) {
+    const maxScroll = Math.max(0, contentH - avail);
+    if (maxScroll <= 0) {
+      scrollbar = null;
+      return;
+    }
+    const x = canvas.clientWidth - 7;
+    const thumbH = Math.max(24, (avail / contentH) * avail);
+    const thumbY = top + (readsScrollY / maxScroll) * (avail - thumbH);
+    ctx.fillStyle = "rgba(0,0,0,0.05)";
+    ctx.fillRect(x, top, 5, avail);
+    ctx.fillStyle = "rgba(0,0,0,0.28)";
+    ctx.fillRect(x, thumbY, 5, thumbH);
+    scrollbar = { x, top, avail, thumbY, thumbH, maxScroll };
   }
 
   function draw() {
@@ -323,6 +374,7 @@ function render({ model, el }) {
     ctx.fillText("▸ Alignments", plotLeft(), y + 11);
     y += TRACK_HEADER_H;
     const avail = VIEW_H - y - 2;
+    scrollbar = null;
 
     if (message) {
       ctx.fillStyle = "#9a6a00";
@@ -330,17 +382,21 @@ function render({ model, el }) {
       message.split("\n").forEach((line, i) => {
         ctx.fillText(line, plotLeft(), y + 16 + i * 15);
       });
+    } else if (readData.note) {
+      // Reads not loaded (window wider than max_window) but annotations shown.
+      ctx.fillStyle = "#9a6a00";
+      ctx.font = "12px system-ui, sans-serif";
+      ctx.fillText(readData.note, plotLeft(), y + 16);
     } else {
-      const fitRows = drawReads(readData, y, avail);
-      if ((readData.n_rows || 0) > fitRows) {
-        ctx.fillStyle = COLORS.axis;
-        ctx.font = "10px system-ui, sans-serif";
-        ctx.fillText(
-          `… ${readData.n_rows - fitRows} more row(s) not shown`,
-          plotLeft(),
-          VIEW_H - 4
-        );
-      }
+      const contentH = (readData.n_rows || 0) * READ_ROW_H;
+      readsScrollY = clamp(readsScrollY, 0, Math.max(0, contentH - avail));
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, y, canvas.clientWidth, avail);
+      ctx.clip();
+      drawReads(readData, y, avail, readsScrollY);
+      ctx.restore();
+      drawScrollbar(y, avail, contentH);
     }
     updateStatus(readData);
   }
@@ -354,10 +410,16 @@ function render({ model, el }) {
       txt += `${readData.shown || 0} reads`;
       if (readData.truncated) txt += ` (sampled from ${readData.total})`;
       const sel = model.get("_selected") || {};
-      if (sel.transcript_id) {
-        const reads = readData.reads || [];
-        const compat = reads.filter((r) => r.compat).length;
+      const exons = model.get("_selected_exons") || [];
+      const reads = readData.reads || [];
+      if (sel.transcript_id && exons.length && reads.length) {
+        let compat = 0;
+        for (const r of reads) {
+          if (readCompatible(r.blocks || [[r.start, r.end]], exons)) compat++;
+        }
         txt += ` · ${compat}/${reads.length} compatible with ${sel.transcript_id}`;
+      } else if (sel.transcript_id && !exons.length) {
+        txt += ` · ${sel.transcript_id} (no exon model)`;
       }
     }
     status.textContent = txt;
@@ -383,20 +445,51 @@ function render({ model, el }) {
   }
 
   let drag = null;
+  let scrollDrag = null;
   overlay.addEventListener("mousedown", (e) => {
     const rect = overlay.getBoundingClientRect();
+    const ox = e.clientX - rect.left;
+    const oy = e.clientY - rect.top;
+    // Grab the reads scrollbar if the press lands on it.
+    if (scrollbar && ox >= scrollbar.x - 4 && oy >= scrollbar.top &&
+        oy <= scrollbar.top + scrollbar.avail) {
+      const onThumb =
+        oy >= scrollbar.thumbY && oy <= scrollbar.thumbY + scrollbar.thumbH;
+      if (!onThumb) {
+        // Jump so the thumb centres on the click, then drag from there.
+        const frac =
+          (oy - scrollbar.top - scrollbar.thumbH / 2) /
+          (scrollbar.avail - scrollbar.thumbH);
+        readsScrollY = clamp(frac * scrollbar.maxScroll, 0, scrollbar.maxScroll);
+        draw();
+      }
+      scrollDrag = { startOy: oy, startScroll: readsScrollY, sb: scrollbar };
+      return;
+    }
     drag = {
       x: e.clientX,
       downX: e.clientX,
       downY: e.clientY,
-      ox: e.clientX - rect.left,
-      oy: e.clientY - rect.top,
+      ox,
+      oy,
       start: view.start,
       end: view.end,
       moved: false,
     };
   });
   window.addEventListener("mousemove", (e) => {
+    if (scrollDrag) {
+      const rect = overlay.getBoundingClientRect();
+      const dy = e.clientY - rect.top - scrollDrag.startOy;
+      const range = scrollDrag.sb.avail - scrollDrag.sb.thumbH;
+      readsScrollY = clamp(
+        scrollDrag.startScroll + (dy / range) * scrollDrag.sb.maxScroll,
+        0,
+        scrollDrag.sb.maxScroll
+      );
+      draw();
+      return;
+    }
     if (!drag) return;
     // Stay a "click" until the pointer clearly moves, so selecting a feature
     // doesn't accidentally pan the view.
@@ -420,6 +513,10 @@ function render({ model, el }) {
     scheduleCommit();
   });
   window.addEventListener("mouseup", () => {
+    if (scrollDrag) {
+      scrollDrag = null;
+      return;
+    }
     if (!drag) return;
     const d = drag;
     drag = null;
@@ -439,10 +536,21 @@ function render({ model, el }) {
     "wheel",
     (e) => {
       e.preventDefault();
+      // Shift+wheel (or wheel while the reads overflow and Shift is held)
+      // scrolls the alignments vertically instead of zooming.
+      if (e.shiftKey && scrollbar) {
+        readsScrollY = clamp(
+          readsScrollY + e.deltaY,
+          0,
+          scrollbar.maxScroll
+        );
+        draw();
+        return;
+      }
       const rect = overlay.getBoundingClientRect();
       const anchorBp = pxToBp(e.clientX - rect.left);
       const factor = Math.exp(e.deltaY * 0.0015);
-      const newW = clamp(width() * factor, MIN_WIDTH, 50 * model.get("max_window"));
+      const newW = clamp(width() * factor, MIN_WIDTH, maxWidth());
       const frac = (anchorBp - view.start) / width();
       view.start = anchorBp - frac * newW;
       view.end = view.start + newW - 1;
@@ -463,7 +571,7 @@ function render({ model, el }) {
   }
   function zoomBy(factor) {
     const center = (view.start + view.end) / 2;
-    const newW = clamp(width() * factor, MIN_WIDTH, 50 * model.get("max_window"));
+    const newW = clamp(width() * factor, MIN_WIDTH, maxWidth());
     view.start = center - newW / 2;
     view.end = view.start + newW - 1;
     clampView();
@@ -553,15 +661,23 @@ function render({ model, el }) {
     if (selfUpdating || drag) return;
     const v = model.get("_view") || [];
     if (v[0] !== view.chrom || v[1] !== view.start || v[2] !== view.end) {
+      // Adopt an external view change (e.g. Python goto) and redraw. When the
+      // view already matches (our own commit echoing back), do nothing — the
+      // reload's change:_read_data handles the redraw, avoiding a transient
+      // frame drawn against half-applied data.
       view.chrom = v[0];
       view.start = v[1];
       view.end = v[2];
+      draw();
     }
-    draw();
   }
-  model.on("change:_read_data", draw);
+  model.on("change:_read_data", () => {
+    readsScrollY = 0; // start each freshly-loaded window at the top
+    draw();
+  });
   model.on("change:_feature_data", draw);
   model.on("change:_selected", draw);
+  model.on("change:_selected_exons", draw);
   model.on("change:_message", draw);
   model.on("change:_loading", () => updateStatus(model.get("_read_data") || {}));
   model.on("change:_view", onRegionTrait);

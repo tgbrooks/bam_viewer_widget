@@ -80,7 +80,8 @@ class BamViewer(anywidget.AnyWidget):
 
     # --- configuration (set once from Python) ---------------------------------
     bam_path = traitlets.Unicode().tag(sync=True)
-    max_window = traitlets.Int(100_000).tag(sync=True)
+    max_window = traitlets.Int(300_000).tag(sync=True)
+    max_annotation_window = traitlets.Int(1_000_000).tag(sync=True)
     max_reads = traitlets.Int(5000).tag(sync=True)
     track_names = traitlets.List(traitlets.Unicode()).tag(sync=True)
     contigs = traitlets.Dict().tag(sync=True)
@@ -89,9 +90,11 @@ class BamViewer(anywidget.AnyWidget):
     #     atomic update (and therefore exactly one reload), not three. ----------
     _view = traitlets.List().tag(sync=True)
 
-    # --- selected isoform: {track, transcript_id} (empty = none). Reads that
-    #     are incompatible with it are faded out in the frontend. --------------
+    # --- selected isoform: {track, transcript_id} (empty = none), plus its full
+    #     exon list. The frontend judges each read's compatibility against these
+    #     exons itself, so selecting never re-queries reads (no reload race). ---
     _selected = traitlets.Dict().tag(sync=True)
+    _selected_exons = traitlets.List().tag(sync=True)
 
     # --- data pushed to the frontend ------------------------------------------
     _read_data = traitlets.Dict().tag(sync=True)
@@ -105,7 +108,8 @@ class BamViewer(anywidget.AnyWidget):
         region: Optional[str] = None,
         gtf_tracks: Optional[Mapping[str, GtfSource]] = None,
         *,
-        max_window: int = 100_000,
+        max_window: int = 300_000,
+        max_annotation_window: int = 1_000_000,
         max_reads: int = 5000,
         **kwargs,
     ):
@@ -133,6 +137,7 @@ class BamViewer(anywidget.AnyWidget):
         super().__init__(
             bam_path=bam_path,
             max_window=max_window,
+            max_annotation_window=max_annotation_window,
             max_reads=max_reads,
             track_names=list(self._gtf_frames),
             contigs=contigs,
@@ -168,32 +173,35 @@ class BamViewer(anywidget.AnyWidget):
 
     @traitlets.observe("_selected")
     def _on_selection_change(self, _change):
-        # Recompute read compatibility against the newly selected isoform.
-        if not getattr(self, "_suspend_reload", False):
-            self._reload()
+        # Publish the selected isoform's full exons; the frontend recomputes
+        # compatibility from these. No read reload -> no ordering race, instant.
+        self._selected_exons = self._compute_selected_exons()
 
-    def _selected_exons(self):
-        """Full exon list of the currently selected isoform, or ``None``."""
+    def _compute_selected_exons(self):
+        """Full exon list of the currently selected isoform ([] if none)."""
         sel = self._selected or {}
         track, tid = sel.get("track"), sel.get("transcript_id")
         df = self._gtf_frames.get(track)
         if df is None or not tid:
-            return None
-        exons = _data.transcript_exons(df, tid)
-        return exons or None
+            return []
+        return _data.transcript_exons(df, tid)
 
     def _reload(self):
-        """Load reads + features for the current window and push to frontend."""
+        """Load reads + features for the current window and push to frontend.
+
+        Annotations render for windows up to ``max_annotation_window``; reads,
+        which are far heavier, only up to the smaller ``max_window``.
+        """
         chrom, start, end = self._view
         start, end = int(start), int(end)
         if end < start:
             start, end = end, start
         width = end - start + 1
 
-        if width > self.max_window:
+        if width > self.max_annotation_window:
             self._message = (
                 f"Window too large ({width:,} bp). Zoom in to "
-                f"≤ {self.max_window:,} bp to view reads."
+                f"≤ {self.max_annotation_window:,} bp."
             )
             self._read_data = dict(_EMPTY_READS)
             self._feature_data = []
@@ -201,14 +209,20 @@ class BamViewer(anywidget.AnyWidget):
 
         self._loading = True
         try:
-            self._read_data = _data.query_reads(
-                self.bam_path, chrom, start, end, max_reads=self.max_reads,
-                selected_exons=self._selected_exons(),
-            )
             self._feature_data = [
                 {"name": name, **_data.query_features(df, chrom, start, end)}
                 for name, df in self._gtf_frames.items()
             ]
+            if width > self.max_window:
+                # Too wide for reads, but annotations still render.
+                self._read_data = {
+                    **_EMPTY_READS,
+                    "note": f"Zoom in to ≤ {self.max_window:,} bp to see reads.",
+                }
+            else:
+                self._read_data = _data.query_reads(
+                    self.bam_path, chrom, start, end, max_reads=self.max_reads
+                )
             self._message = ""
         except Exception:  # surface load errors in the widget, don't crash
             self._message = "Error loading region:\n" + traceback.format_exc(limit=2)

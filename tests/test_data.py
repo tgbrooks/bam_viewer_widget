@@ -75,15 +75,34 @@ def test_query_reads_with_selection(bam_path, gtf_path):
         assert isinstance(r["compat"], bool)
 
 
-def test_widget_selection_fades(bam_path, gtf_path):
+def test_widget_selection_publishes_exons(bam_path, gtf_path):
+    # Selecting an isoform publishes its full exon list (the frontend judges
+    # compatibility from that); it must not re-query or alter the reads.
     w = BamViewer(bam_path, region="chr1:1,000-9,000", gtf_tracks={"genes": gtf_path})
-    assert "compat" not in (w._read_data["reads"][0] if w._read_data["reads"] else {})
+    assert w._selected_exons == []
+    reads_before = w._read_data["reads"]
     w.select_transcript("T1")
     assert w.selected_transcript == "T1"
-    assert all("compat" in r for r in w._read_data["reads"])
+    assert w._selected_exons == [[1000, 2000], [5000, 6000], [8000, 9000]]
+    assert w._read_data["reads"] is reads_before  # reads untouched, no reload
     w.clear_selection()
     assert w.selected_transcript is None
-    assert "compat" not in (w._read_data["reads"][0] if w._read_data["reads"] else {})
+    assert w._selected_exons == []
+
+
+def test_transcript_exons_cds_only(tmp_path):
+    # A GTF describing a transcript with CDS/UTR but no exon lines still yields
+    # a usable exon model (reconstructed from CDS + UTR, merged).
+    p = tmp_path / "cds.gtf"
+    p.write_text(
+        'chr1\tt\ttranscript\t1000\t7000\t.\t+\t.\tgene_id "G1"; transcript_id "T1";\n'
+        'chr1\tt\tfive_prime_utr\t1000\t1099\t.\t+\t.\tgene_id "G1"; transcript_id "T1";\n'
+        'chr1\tt\tCDS\t1100\t1200\t.\t+\t0\tgene_id "G1"; transcript_id "T1";\n'
+        'chr1\tt\tCDS\t5000\t6900\t.\t+\t0\tgene_id "G1"; transcript_id "T1";\n'
+        'chr1\tt\tthree_prime_utr\t6901\t7000\t.\t+\t.\tgene_id "G1"; transcript_id "T1";\n'
+    )
+    exons = _data.transcript_exons(_data.load_gtf(str(p)), "T1")
+    assert exons == [[1000, 1200], [5000, 7000]]
 
 
 def test_parse_region():
@@ -215,10 +234,23 @@ def test_widget_construction_and_reload(bam_path, gtf_path):
     assert w._feature_data[0]["features"], "GTF features should load in gene region"
 
 
-def test_widget_window_too_large(bam_path):
-    w = BamViewer(bam_path, region="chr1:1-100,000", max_window=10_000)
+def test_widget_reads_window_vs_annotation_window(bam_path, gtf_path):
+    # Between max_window and max_annotation_window: annotations load, reads are
+    # withheld with a "zoom in" note (no global error message).
+    w = BamViewer(
+        bam_path, region="chr1:1-30,000", gtf_tracks={"genes": gtf_path},
+        max_window=10_000, max_annotation_window=50_000,
+    )
+    assert w._message == ""
+    assert w._read_data["reads"] == []
+    assert "note" in w._read_data and "zoom in" in w._read_data["note"].lower()
+    assert w._feature_data[0]["features"]  # annotations still present
+
+    # Beyond max_annotation_window: nothing renders, a message explains why.
+    w.goto("chr1:1-100,000")
     assert "too large" in w._message.lower()
     assert w._read_data["reads"] == []
+    assert w._feature_data == []
 
 
 def test_widget_goto(bam_path):
