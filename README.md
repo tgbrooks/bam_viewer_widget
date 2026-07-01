@@ -20,6 +20,11 @@ itself.
   files (or preloaded polars DataFrames); exons, CDS, and strand are drawn as a
   familiar gene model. Annotations are loaded into memory once and filtered per
   view — GTFs are small and usually unindexed, so there's nothing to re-read.
+- **Isoform compatibility.** Click a transcript to select it; reads that are
+  *incompatible* with that isoform fade out, leaving the supporting reads. A
+  read is compatible when every aligned base falls inside the isoform's exons
+  and every splice junction matches an annotated one. The full transcript is
+  used for the test even when only part of it is on screen.
 - **Lightweight by design.** Refuses to render windows larger than
   `max_window` (default 100 kb) and samples dense pileups down to `max_reads`
   (default 5000) so the browser never chokes. There's no whole-chromosome view.
@@ -85,6 +90,21 @@ Drive it from Python (attribute access is proxied to the widget):
 ```python
 viewer.goto("chr2:500-2,500")
 ```
+
+### Isoform compatibility highlighting
+
+Click any transcript in a GTF track to select it — reads incompatible with that
+isoform fade out and the status bar shows how many reads are compatible. Click
+it again (or click empty space) to clear. You can also drive it from Python:
+
+```python
+viewer.select_transcript("ENST00000367770")   # track defaults to the first one
+viewer.selected_transcript                      # -> "ENST00000367770"
+viewer.clear_selection()
+```
+
+Compatibility is judged against the *complete* transcript (from the preloaded
+GTF), so it stays correct even when the isoform runs off the edge of the view.
 
 ### Constructor
 

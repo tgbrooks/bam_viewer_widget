@@ -81,6 +81,37 @@ def pack_intervals(items: list[dict], gap: int) -> int:
     return len(row_last_end)
 
 
+def read_compatible(blocks: list[list[int]], exons: list[list[int]]) -> bool:
+    """Is a read (its aligned ``blocks``) compatible with an isoform (``exons``)?
+
+    Compatible means every aligned base lies within an exon of the isoform and
+    every splice junction in the read matches an annotated junction (i.e. the
+    read walks consecutive exons, splicing exactly at their boundaries).  The
+    read may start/end partway into its first/last exon.  ``exons`` must be
+    sorted and non-overlapping; both coordinate systems are 1-based inclusive.
+    """
+    n = len(blocks)
+    if n == 0 or not exons:
+        return False
+    # Locate the exon containing the first block's start.
+    b0 = blocks[0][0]
+    j = next((i for i, (es, ee) in enumerate(exons) if es <= b0 <= ee), None)
+    if j is None:
+        return False
+    for i, (bs, be) in enumerate(blocks):
+        if j >= len(exons):
+            return False  # read has more spliced segments than the isoform
+        es, ee = exons[j]
+        if bs < es or be > ee:
+            return False  # aligned base outside this exon (in an intron / flank)
+        if i > 0 and bs != es:
+            return False  # spliced-in edge must meet the exon's start
+        if i < n - 1 and be != ee:
+            return False  # spliced-out edge must meet the exon's end
+        j += 1
+    return True
+
+
 def query_reads(
     bam_path: str,
     chrom: str,
@@ -88,6 +119,7 @@ def query_reads(
     end: int,
     *,
     max_reads: int = 5000,
+    selected_exons: Optional[list[list[int]]] = None,
 ) -> dict:
     """Load and lay out reads overlapping ``chrom:start-end`` from a BAM file.
 
@@ -125,6 +157,8 @@ def query_reads(
         # frontend draws a single rectangle from start..end.
         if len(blocks) > 1:
             read["blocks"] = blocks
+        if selected_exons is not None:
+            read["compat"] = read_compatible(blocks, selected_exons)
         reads.append(read)
 
     reads.sort(key=lambda r: r["start"])
@@ -147,6 +181,30 @@ _SPAN_TYPES = frozenset({"transcript", "mRNA", "gene"})
 
 _GTF_CORE = ("chrom", "start", "end", "type", "strand")
 _GTF_ATTR_FIELDS = ("gene_id", "transcript_id", "gene_name")
+
+
+def transcript_exons(gtf: pl.DataFrame, transcript_id: str) -> list[list[int]]:
+    """Return the full, merged exon list of a transcript from a preloaded GTF.
+
+    Uses the whole in-memory annotation (not a windowed view), so read
+    compatibility can be judged against the complete isoform even when only
+    part of it is on screen.  Exons are 1-based inclusive, sorted, and merged
+    where they touch or overlap.
+    """
+    sub = gtf.filter(
+        (pl.col("transcript_id") == transcript_id)
+        & pl.col("type").is_in(list(_EXONIC))
+    ).select(["start", "end"])
+    if sub.height == 0:
+        return []
+    raw = sorted([int(s), int(e)] for s, e in sub.iter_rows())
+    merged: list[list[int]] = []
+    for s, e in raw:
+        if merged and s <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return merged
 
 
 def _extract_attr(tag: str) -> pl.Expr:

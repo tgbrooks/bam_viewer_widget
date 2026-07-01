@@ -89,6 +89,10 @@ class BamViewer(anywidget.AnyWidget):
     #     atomic update (and therefore exactly one reload), not three. ----------
     _view = traitlets.List().tag(sync=True)
 
+    # --- selected isoform: {track, transcript_id} (empty = none). Reads that
+    #     are incompatible with it are faded out in the frontend. --------------
+    _selected = traitlets.Dict().tag(sync=True)
+
     # --- data pushed to the frontend ------------------------------------------
     _read_data = traitlets.Dict().tag(sync=True)
     _feature_data = traitlets.List().tag(sync=True)
@@ -162,6 +166,22 @@ class BamViewer(anywidget.AnyWidget):
         if not getattr(self, "_suspend_reload", False):
             self._reload()
 
+    @traitlets.observe("_selected")
+    def _on_selection_change(self, _change):
+        # Recompute read compatibility against the newly selected isoform.
+        if not getattr(self, "_suspend_reload", False):
+            self._reload()
+
+    def _selected_exons(self):
+        """Full exon list of the currently selected isoform, or ``None``."""
+        sel = self._selected or {}
+        track, tid = sel.get("track"), sel.get("transcript_id")
+        df = self._gtf_frames.get(track)
+        if df is None or not tid:
+            return None
+        exons = _data.transcript_exons(df, tid)
+        return exons or None
+
     def _reload(self):
         """Load reads + features for the current window and push to frontend."""
         chrom, start, end = self._view
@@ -182,7 +202,8 @@ class BamViewer(anywidget.AnyWidget):
         self._loading = True
         try:
             self._read_data = _data.query_reads(
-                self.bam_path, chrom, start, end, max_reads=self.max_reads
+                self.bam_path, chrom, start, end, max_reads=self.max_reads,
+                selected_exons=self._selected_exons(),
             )
             self._feature_data = [
                 {"name": name, **_data.query_features(df, chrom, start, end)}
@@ -218,3 +239,22 @@ class BamViewer(anywidget.AnyWidget):
         """Jump the view to ``region`` (``"chrom:start-end"`` or ``"chrom"``)."""
         chrom, start, end = self._initial_region(region, dict(self.contigs))
         self._view = [chrom, start, end]  # fires the observer -> reload
+
+    @property
+    def selected_transcript(self) -> Optional[str]:
+        """The transcript_id of the currently selected isoform, or ``None``."""
+        return (self._selected or {}).get("transcript_id")
+
+    def select_transcript(self, transcript_id: str, track: Optional[str] = None) -> None:
+        """Select an isoform so reads incompatible with it fade out.
+
+        ``track`` defaults to the first GTF track. Pass ``None`` transcript to
+        :meth:`clear_selection`.
+        """
+        if track is None:
+            track = next(iter(self._gtf_frames), None)
+        self._selected = {"track": track, "transcript_id": transcript_id}
+
+    def clear_selection(self) -> None:
+        """Clear any selected isoform (all reads return to full opacity)."""
+        self._selected = {}

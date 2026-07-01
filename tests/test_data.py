@@ -24,6 +24,68 @@ def test_cigar_blocks_softclip_and_deletion():
     assert blocks == [[100, 204]]
 
 
+EXONS = [[1000, 2000], [5000, 6000], [8000, 9000]]  # a 3-exon isoform
+
+
+def test_read_compatible_single_exon_read():
+    # Unspliced read fully inside one exon -> compatible.
+    assert _data.read_compatible([[1200, 1800]], EXONS)
+    # Unspliced read inside an intron -> incompatible.
+    assert not _data.read_compatible([[3000, 3500]], EXONS)
+    # Unspliced read straddling an exon/intron boundary -> incompatible.
+    assert not _data.read_compatible([[1800, 2200]], EXONS)
+
+
+def test_read_compatible_spliced():
+    # Junction exactly matching annotated exon1->exon2 boundary -> compatible.
+    assert _data.read_compatible([[1500, 2000], [5000, 5500]], EXONS)
+    # Spanning three exons, matching both junctions -> compatible.
+    assert _data.read_compatible([[1900, 2000], [5000, 6000], [8000, 8100]], EXONS)
+
+
+def test_read_compatible_wrong_junction():
+    # Right exons but the splice donor is off by a base -> incompatible.
+    assert not _data.read_compatible([[1500, 1999], [5000, 5500]], EXONS)
+    # Skips exon2 (junction exon1->exon3 is not annotated) -> incompatible.
+    assert not _data.read_compatible([[1500, 2000], [8000, 8500]], EXONS)
+    # An interior block must fill its exon exactly.
+    assert not _data.read_compatible([[1900, 2000], [5000, 5500], [8000, 8100]], EXONS)
+
+
+def test_read_compatible_beyond_transcript():
+    # Extends 5' of the first exon -> some aligned bases outside the isoform.
+    assert not _data.read_compatible([[900, 1500]], EXONS)
+    assert not _data.read_compatible([[1500, 2000], [5000, 6000], [8000, 9500]], EXONS)
+
+
+def test_transcript_exons_merges(gtf_path):
+    gtf = _data.load_gtf(gtf_path)
+    exons = _data.transcript_exons(gtf, "T1")
+    assert exons == [[1000, 2000], [5000, 6000], [8000, 9000]]
+    assert _data.transcript_exons(gtf, "nope") == []
+
+
+def test_query_reads_with_selection(bam_path, gtf_path):
+    exons = _data.transcript_exons(_data.load_gtf(gtf_path), "T1")
+    out = _data.query_reads(bam_path, "chr1", 1000, 9000, selected_exons=exons)
+    assert all("compat" in r for r in out["reads"])
+    # Some reads land inside exons (compatible), some don't.
+    assert any(r["compat"] for r in out["reads"])
+    for r in out["reads"]:
+        assert isinstance(r["compat"], bool)
+
+
+def test_widget_selection_fades(bam_path, gtf_path):
+    w = BamViewer(bam_path, region="chr1:1,000-9,000", gtf_tracks={"genes": gtf_path})
+    assert "compat" not in (w._read_data["reads"][0] if w._read_data["reads"] else {})
+    w.select_transcript("T1")
+    assert w.selected_transcript == "T1"
+    assert all("compat" in r for r in w._read_data["reads"])
+    w.clear_selection()
+    assert w.selected_transcript is None
+    assert "compat" not in (w._read_data["reads"][0] if w._read_data["reads"] else {})
+
+
 def test_parse_region():
     assert _data.parse_region("chr1") == ("chr1", None, None)
     assert _data.parse_region("chr1:1,000-9,000") == ("chr1", 1000, 9000)

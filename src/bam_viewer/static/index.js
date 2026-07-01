@@ -24,7 +24,11 @@ const COLORS = {
   axis: "#444",
   tick: "#888",
   grid: "#f0f0f0",
+  selected: "#e8a23d",
+  selectedBg: "rgba(232, 162, 61, 0.18)",
 };
+
+const FADED_ALPHA = 0.12; // opacity of reads incompatible with the selection
 
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
@@ -93,6 +97,20 @@ function render({ model, el }) {
   function contigLen() {
     const c = model.get("contigs") || {};
     return c[view.chrom] || Infinity;
+  }
+
+  // Is an isoform currently selected? Does this feature match it?
+  function selectionActive() {
+    const s = model.get("_selected") || {};
+    return !!s.transcript_id;
+  }
+  function isSelected(trackName, f) {
+    const s = model.get("_selected") || {};
+    return (
+      !!s.transcript_id &&
+      f.transcript_id === s.transcript_id &&
+      s.track === trackName
+    );
   }
 
   // Snap the view to whole-bp integers and keep it inside the contig.
@@ -170,13 +188,19 @@ function render({ model, el }) {
     ctx.fillText(label, plotLeft(), 12);
   }
 
-  function drawFeature(f, top) {
+  function drawFeature(f, top, trackName) {
     const y = top + f.row * FEAT_ROW_H;
     const cy = y + FEAT_ROW_H / 2;
     const x0 = clamp(bpToPx(f.start), -5, canvas.clientWidth + 5);
     const x1 = clamp(bpToPx(f.end + 1), -5, canvas.clientWidth + 5);
+    const selected = isSelected(trackName, f);
+    if (selected) {
+      // Highlight band behind the selected isoform's whole row.
+      ctx.fillStyle = COLORS.selectedBg;
+      ctx.fillRect(plotLeft(), y, plotWidth(), FEAT_ROW_H - 1);
+    }
     // Intron / backbone line.
-    ctx.strokeStyle = COLORS.intron;
+    ctx.strokeStyle = selected ? COLORS.selected : COLORS.intron;
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(x0, cy);
@@ -193,7 +217,7 @@ function render({ model, el }) {
         ctx.stroke();
       }
     }
-    ctx.fillStyle = COLORS.exon;
+    ctx.fillStyle = selected ? COLORS.selected : COLORS.exon;
     if (f.exons && f.exons.length) {
       for (const [es, ee] of f.exons) {
         const ex0 = bpToPx(es);
@@ -220,13 +244,14 @@ function render({ model, el }) {
       if (x0 - tw - 4 > plotLeft()) ctx.fillText(f.name, x0 - tw - 4, cy + 3);
       else ctx.fillText(f.name, Math.max(plotLeft(), x0) + 3, cy + 3);
     }
-    hitFeats.push({ x0, x1, y0: y, y1: y + FEAT_ROW_H, f });
+    hitFeats.push({ x0, x1, y0: y, y1: y + FEAT_ROW_H, f, track: trackName });
   }
 
   function drawReads(data, top, avail) {
     hitReads = [];
     const fitRows = Math.floor(avail / READ_ROW_H);
     const pw = plotWidth();
+    const selecting = selectionActive();
     for (const r of data.reads) {
       if (r.row >= fitRows) continue;
       const y = top + r.row * READ_ROW_H;
@@ -235,8 +260,11 @@ function render({ model, el }) {
       const x1all = bpToPx(r.end + 1);
       if (x1all < plotLeft() || x0all > plotLeft() + pw) continue;
       const base = r.strand === "-" ? COLORS.minus : COLORS.plus;
-      // Low mapping quality fades out.
-      ctx.globalAlpha = r.mapq <= 0 ? 0.35 : r.mapq < 10 ? 0.6 : 1;
+      // With an isoform selected, incompatible reads fade right out; otherwise
+      // low mapping quality fades a little.
+      ctx.globalAlpha = selecting
+        ? (r.compat ? 1 : FADED_ALPHA)
+        : (r.mapq <= 0 ? 0.35 : r.mapq < 10 ? 0.6 : 1);
       // Connector line across the whole read (covers intron gaps).
       ctx.strokeStyle = COLORS.intron;
       ctx.beginPath();
@@ -285,7 +313,7 @@ function render({ model, el }) {
       ctx.fillText(`▸ ${track.name}${note}`, plotLeft(), y + 11);
       y += TRACK_HEADER_H;
       const rows = Math.max(1, track.n_rows || 0);
-      for (const f of track.features || []) drawFeature(f, y);
+      for (const f of track.features || []) drawFeature(f, y, track.name);
       y += rows * FEAT_ROW_H + SECTION_GAP;
     }
 
@@ -325,21 +353,66 @@ function render({ model, el }) {
     if (!model.get("_message")) {
       txt += `${readData.shown || 0} reads`;
       if (readData.truncated) txt += ` (sampled from ${readData.total})`;
+      const sel = model.get("_selected") || {};
+      if (sel.transcript_id) {
+        const reads = readData.reads || [];
+        const compat = reads.filter((r) => r.compat).length;
+        txt += ` · ${compat}/${reads.length} compatible with ${sel.transcript_id}`;
+      }
     }
     status.textContent = txt;
   }
 
   // ---- interaction ---------------------------------------------------------
+  const DRAG_THRESHOLD = 4; // px of movement before a press counts as a drag
+
+  function featureAt(x, y) {
+    for (const h of hitFeats) {
+      if (x >= h.x0 - 2 && x <= h.x1 + 2 && y >= h.y0 && y <= h.y1) return h;
+    }
+    return null;
+  }
+  function setSelection(sel) {
+    model.set("_selected", sel);
+    model.save_changes();
+  }
+  function toggleSelect(track, f) {
+    const s = model.get("_selected") || {};
+    if (s.transcript_id === f.transcript_id && s.track === track) setSelection({});
+    else setSelection({ track, transcript_id: f.transcript_id });
+  }
+
   let drag = null;
   overlay.addEventListener("mousedown", (e) => {
-    drag = { x: e.clientX, start: view.start, end: view.end };
-    overlay.classList.add("bamv-dragging");
+    const rect = overlay.getBoundingClientRect();
+    drag = {
+      x: e.clientX,
+      downX: e.clientX,
+      downY: e.clientY,
+      ox: e.clientX - rect.left,
+      oy: e.clientY - rect.top,
+      start: view.start,
+      end: view.end,
+      moved: false,
+    };
   });
   window.addEventListener("mousemove", (e) => {
     if (!drag) return;
-    const dx = e.clientX - drag.x;
+    // Stay a "click" until the pointer clearly moves, so selecting a feature
+    // doesn't accidentally pan the view.
+    if (
+      !drag.moved &&
+      Math.abs(e.clientX - drag.downX) < DRAG_THRESHOLD &&
+      Math.abs(e.clientY - drag.downY) < DRAG_THRESHOLD
+    ) {
+      return;
+    }
+    if (!drag.moved) {
+      drag.moved = true;
+      overlay.classList.add("bamv-dragging");
+    }
     const span = drag.end - drag.start + 1;
-    const dbp = (dx / plotWidth()) * span;
+    const dbp = ((e.clientX - drag.x) / plotWidth()) * span;
     view.start = drag.start - dbp;
     view.end = view.start + span - 1;
     clampView();
@@ -348,9 +421,18 @@ function render({ model, el }) {
   });
   window.addEventListener("mouseup", () => {
     if (!drag) return;
+    const d = drag;
     drag = null;
     overlay.classList.remove("bamv-dragging");
-    commit();
+    if (d.moved) {
+      commit();
+      return;
+    }
+    // A click (no meaningful drag): select the isoform under the cursor, or
+    // clear the selection when clicking empty space.
+    const hit = featureAt(d.ox, d.oy);
+    if (hit && hit.f.transcript_id) toggleSelect(hit.track, hit.f);
+    else if (!hit && (model.get("_selected") || {}).transcript_id) setSelection({});
   });
 
   overlay.addEventListener(
@@ -439,7 +521,12 @@ function render({ model, el }) {
         if (x >= h.x0 - 2 && x <= h.x1 + 2 && yy >= h.y0 && yy <= h.y1) {
           const f = h.f;
           hit = `<b>${f.name || "feature"}</b><br>${view.chrom}:${fmtBp(f.start)}-${fmtBp(f.end)} (${f.strand})`;
-          if (f.transcript_id) hit += `<br>transcript ${f.transcript_id}`;
+          if (f.transcript_id) {
+            hit += `<br>transcript ${f.transcript_id}`;
+            hit += isSelected(h.track, f)
+              ? "<br><i>click to deselect</i>"
+              : "<br><i>click to select isoform</i>";
+          }
           break;
         }
       }
@@ -474,6 +561,7 @@ function render({ model, el }) {
   }
   model.on("change:_read_data", draw);
   model.on("change:_feature_data", draw);
+  model.on("change:_selected", draw);
   model.on("change:_message", draw);
   model.on("change:_loading", () => updateStatus(model.get("_read_data") || {}));
   model.on("change:_view", onRegionTrait);
