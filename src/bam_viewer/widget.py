@@ -174,20 +174,31 @@ class BamViewer(anywidget.AnyWidget):
 
     @traitlets.observe("_selected")
     def _on_selection_change(self, _change):
-        # Re-publish the current reads with the newly selected isoform's exons
-        # attached (no BAM re-query — the reads are unchanged).
-        rd = dict(self._read_data)
-        rd["selected_exons"] = self._compute_selected_exons()
-        self._publish_reads(rd)
+        # Re-publish the current reads with the new selection's exons attached
+        # (no BAM re-query — the reads are unchanged).
+        self._publish_reads(dict(self._read_data))
 
-    def _compute_selected_exons(self):
-        """Full exon list of the currently selected isoform ([] if none)."""
+    def _compute_exon_sets(self):
+        """Exon lists for the positive and negative selection sets.
+
+        Returns ``(pos_exons, neg_exons)`` where each is a list of exon lists
+        (one per selected transcript). A read is kept if it is compatible with
+        any positive isoform and with no negative isoform.
+        """
         sel = self._selected or {}
-        track, tid = sel.get("track"), sel.get("transcript_id")
-        df = self._gtf_frames.get(track)
-        if df is None or not tid:
-            return []
-        return _data.transcript_exons(df, tid)
+
+        def exons_for(items):
+            out = []
+            for it in items or []:
+                df = self._gtf_frames.get(it.get("track"))
+                tid = it.get("transcript_id")
+                if df is not None and tid:
+                    ex = _data.transcript_exons(df, tid)
+                    if ex:
+                        out.append(ex)
+            return out
+
+        return exons_for(sel.get("pos")), exons_for(sel.get("neg"))
 
     def _next_version(self) -> int:
         v = getattr(self, "_ver", 0) + 1
@@ -195,10 +206,12 @@ class BamViewer(anywidget.AnyWidget):
         return v
 
     def _publish_reads(self, rd: dict) -> None:
-        # Stamp a monotonic version so the frontend can drop stale re-syncs.
-        # (Works around a marimo 0.23.12+ regression where a trait Python
-        # updates in response to a frontend change is clobbered by a stale echo.)
+        # Attach the current selection's exons and stamp a monotonic version so
+        # the frontend can drop stale re-syncs. (Works around a marimo 0.23.12+
+        # regression where a trait Python updates in response to a frontend
+        # change is clobbered by a stale echo.)
         rd = dict(rd)
+        rd["pos_exons"], rd["neg_exons"] = self._compute_exon_sets()
         rd["_v"] = self._next_version()
         self._read_data = rd
 
@@ -216,14 +229,13 @@ class BamViewer(anywidget.AnyWidget):
         if end < start:
             start, end = end, start
         width = end - start + 1
-        exons = self._compute_selected_exons()  # rides along in _read_data
 
         if width > self.max_annotation_window:
             self._message = (
                 f"Window too large ({width:,} bp). Zoom in to "
                 f"≤ {self.max_annotation_window:,} bp."
             )
-            self._publish_reads({**_EMPTY_READS, "selected_exons": exons})
+            self._publish_reads(dict(_EMPTY_READS))
             self._publish_features([])
             return
 
@@ -243,12 +255,11 @@ class BamViewer(anywidget.AnyWidget):
                 rd = _data.query_reads(
                     self.bam_path, chrom, start, end, max_reads=self.max_reads
                 )
-            rd["selected_exons"] = exons
             self._publish_reads(rd)
             self._message = ""
         except Exception:  # surface load errors in the widget, don't crash
             self._message = "Error loading region:\n" + traceback.format_exc(limit=2)
-            self._publish_reads({**_EMPTY_READS, "selected_exons": exons})
+            self._publish_reads(dict(_EMPTY_READS))
             self._publish_features([])
         finally:
             self._loading = False
@@ -277,20 +288,55 @@ class BamViewer(anywidget.AnyWidget):
         self._view = [chrom, start, end]  # fires the observer -> reload
 
     @property
+    def selection(self) -> dict:
+        """Current selection as ``{"positive": [ids], "negative": [ids]}``.
+
+        A read is kept (opaque) if it is compatible with any *positive* isoform
+        and with no *negative* isoform.
+        """
+        sel = self._selected or {}
+        return {
+            "positive": [x["transcript_id"] for x in sel.get("pos", [])],
+            "negative": [x["transcript_id"] for x in sel.get("neg", [])],
+        }
+
+    @property
     def selected_transcript(self) -> Optional[str]:
-        """The transcript_id of the currently selected isoform, or ``None``."""
-        return (self._selected or {}).get("transcript_id")
+        """The first positively-selected transcript_id, or ``None``."""
+        pos = (self._selected or {}).get("pos", [])
+        return pos[0]["transcript_id"] if pos else None
 
     def select_transcript(self, transcript_id: str, track: Optional[str] = None) -> None:
-        """Select an isoform so reads incompatible with it fade out.
+        """Select a single isoform, replacing any current selection."""
+        if track is None:
+            track = next(iter(self._gtf_frames), None)
+        self._selected = {
+            "pos": [{"track": track, "transcript_id": transcript_id}], "neg": []
+        }
 
-        ``track`` defaults to the first GTF track. Pass ``None`` transcript to
-        :meth:`clear_selection`.
+    def add_transcript(
+        self, transcript_id: str, track: Optional[str] = None, *, negative: bool = False
+    ) -> None:
+        """Add an isoform to the positive (or ``negative``) selection set.
+
+        Positive isoforms are OR-combined ("compatible with any"); reads
+        compatible with any negative isoform are excluded.
         """
         if track is None:
             track = next(iter(self._gtf_frames), None)
-        self._selected = {"track": track, "transcript_id": transcript_id}
+        sel = self._selected or {}
+
+        def without(items):
+            return [
+                x for x in items or []
+                if not (x["transcript_id"] == transcript_id and x["track"] == track)
+            ]
+
+        pos, neg = without(sel.get("pos")), without(sel.get("neg"))
+        item = {"track": track, "transcript_id": transcript_id}
+        (neg if negative else pos).append(item)
+        self._selected = {"pos": pos, "neg": neg}
 
     def clear_selection(self) -> None:
-        """Clear any selected isoform (all reads return to full opacity)."""
+        """Clear the selection (all reads return to full opacity)."""
         self._selected = {}

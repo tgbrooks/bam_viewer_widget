@@ -24,7 +24,10 @@ itself.
   *incompatible* with that isoform fade out, leaving the supporting reads. A
   read is compatible when every aligned base falls inside the isoform's exons
   and every splice junction matches an annotated one. The full transcript is
-  used for the test even when only part of it is on screen.
+  used for the test even when only part of it is on screen. **Shift-click** adds
+  more isoforms (a read is kept if compatible with *any*); **Ctrl/Cmd-click**
+  marks isoforms to *exclude* (reads compatible with them are dropped) — so you
+  can isolate "compatible with A or B but not C or D".
 - **Lightweight by design.** Reads render for windows up to `max_window`
   (default 300 kb) and dense pileups are sampled down to `max_reads`
   (default 5000); annotations render for larger windows, up to
@@ -98,17 +101,29 @@ viewer.goto("chr2:500-2,500")
 ### Isoform compatibility highlighting
 
 Click any transcript in a GTF track to select it — reads incompatible with that
-isoform fade out and the status bar shows how many reads are compatible. Click
-it again (or click empty space) to clear. You can also drive it from Python:
+isoform fade out and the status bar shows how many are kept. Build up a query
+with modifiers:
+
+- **click** — select just this isoform (click it again, or click empty space, to
+  clear).
+- **Shift-click** — add an isoform to the *positive* set (orange). A read is kept
+  if it is compatible with **any** positive isoform.
+- **Ctrl/Cmd-click** — add an isoform to the *negative* set (red). Reads
+  compatible with **any** negative isoform are dropped.
+
+So Shift-clicking A and B then Ctrl-clicking C and D shows reads compatible with
+A or B but not C or D. Drive the same thing from Python:
 
 ```python
-viewer.select_transcript("ENST00000367770")   # track defaults to the first one
-viewer.selected_transcript                      # -> "ENST00000367770"
+viewer.select_transcript("ENST0001")            # positive, replaces selection
+viewer.add_transcript("ENST0002")               # add to positive set
+viewer.add_transcript("ENST0009", negative=True)  # exclude
+viewer.selection      # {"positive": ["ENST0001", "ENST0002"], "negative": ["ENST0009"]}
 viewer.clear_selection()
 ```
 
-Compatibility is judged against the *complete* transcript (from the preloaded
-GTF), so it stays correct even when the isoform runs off the edge of the view.
+Compatibility is judged against each *complete* transcript (from the preloaded
+GTF), so it stays correct even when an isoform runs off the edge of the view.
 
 ### Constructor
 

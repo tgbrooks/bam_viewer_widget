@@ -79,15 +79,28 @@ def test_widget_selection_publishes_exons(bam_path, gtf_path):
     # Selecting an isoform attaches its full exon list to _read_data (the
     # frontend judges compatibility from that) without re-querying the reads.
     w = BamViewer(bam_path, region="chr1:1,000-9,000", gtf_tracks={"genes": gtf_path})
-    assert w._read_data.get("selected_exons") == []
+    assert w._read_data.get("pos_exons") == []
     reads_before = w._read_data["reads"]
     w.select_transcript("T1")
     assert w.selected_transcript == "T1"
-    assert w._read_data["selected_exons"] == [[1000, 2000], [5000, 6000], [8000, 9000]]
+    assert w._read_data["pos_exons"] == [[[1000, 2000], [5000, 6000], [8000, 9000]]]
+    assert w._read_data["neg_exons"] == []
     assert w._read_data["reads"] is reads_before  # reads untouched, no reload
     w.clear_selection()
     assert w.selected_transcript is None
-    assert w._read_data["selected_exons"] == []
+    assert w._read_data["pos_exons"] == []
+
+
+def test_widget_positive_negative_sets(bam_path, gtf_path):
+    # Positive set is OR-combined; negative set is added separately.
+    w = BamViewer(bam_path, region="chr1:1,000-9,000", gtf_tracks={"genes": gtf_path})
+    w.select_transcript("T1")
+    w.add_transcript("T1", negative=True)  # moving to negative removes from pos
+    assert w.selection == {"positive": [], "negative": ["T1"]}
+    assert w._read_data["pos_exons"] == []
+    assert w._read_data["neg_exons"] == [[[1000, 2000], [5000, 6000], [8000, 9000]]]
+    w.clear_selection()
+    assert w.selection == {"positive": [], "negative": []}
 
 
 def test_transcript_exons_cds_only(tmp_path):

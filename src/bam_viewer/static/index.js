@@ -24,8 +24,14 @@ const COLORS = {
   axis: "#444",
   tick: "#888",
   grid: "#f0f0f0",
-  selected: "#e8a23d",
-  selectedBg: "rgba(232, 162, 61, 0.18)",
+  // Positive selection (orange) and negative/excluded selection (red), each
+  // with a darker shade for CDS so coding regions highlight too.
+  posSel: "#e8a23d",
+  posSelCds: "#b9781f",
+  posSelBg: "rgba(232, 162, 61, 0.18)",
+  negSel: "#d06a6a",
+  negSelCds: "#a84444",
+  negSelBg: "rgba(208, 106, 106, 0.16)",
 };
 
 const FADED_ALPHA = 0.12; // opacity of reads incompatible with the selection
@@ -75,6 +81,15 @@ function readCompatible(blocks, exons) {
     j++;
   }
   return true;
+}
+
+// A read is kept (opaque) when it is compatible with any positive isoform (or
+// there are none) and with no negative isoform. `pos`/`neg` are lists of exon
+// lists.
+function readKept(blocks, pos, neg) {
+  const okPos = pos.length === 0 || pos.some((ex) => readCompatible(blocks, ex));
+  const okNeg = !neg.some((ex) => readCompatible(blocks, ex));
+  return okPos && okNeg;
 }
 
 function render({ model, el }) {
@@ -143,14 +158,17 @@ function render({ model, el }) {
     return c[view.chrom] || Infinity;
   }
 
-  // Does this feature match the current selection (for highlighting)?
-  function isSelected(trackName, f) {
+  // Is this feature in the positive set ("pos"), negative set ("neg"), or
+  // neither (null)? Used for highlighting.
+  function selKind(trackName, f) {
     const s = model.get("_selected") || {};
-    return (
-      !!s.transcript_id &&
-      f.transcript_id === s.transcript_id &&
-      s.track === trackName
-    );
+    const has = (list) =>
+      (list || []).some(
+        (x) => x.transcript_id === f.transcript_id && x.track === trackName
+      );
+    if (has(s.pos)) return "pos";
+    if (has(s.neg)) return "neg";
+    return null;
   }
 
   // Snap the view to whole-bp integers and keep it inside the contig.
@@ -229,14 +247,18 @@ function render({ model, el }) {
     const cy = y + FEAT_ROW_H / 2;
     const x0 = clamp(bpToPx(f.start), -5, canvas.clientWidth + 5);
     const x1 = clamp(bpToPx(f.end + 1), -5, canvas.clientWidth + 5);
-    const selected = isSelected(trackName, f);
-    if (selected) {
+    const kind = selKind(trackName, f); // "pos" | "neg" | null
+    const exonColor = kind === "pos" ? COLORS.posSel
+      : kind === "neg" ? COLORS.negSel : COLORS.exon;
+    const cdsColor = kind === "pos" ? COLORS.posSelCds
+      : kind === "neg" ? COLORS.negSelCds : COLORS.cds;
+    if (kind) {
       // Highlight band behind the selected isoform's whole row.
-      ctx.fillStyle = COLORS.selectedBg;
+      ctx.fillStyle = kind === "pos" ? COLORS.posSelBg : COLORS.negSelBg;
       ctx.fillRect(plotLeft(), y, plotWidth(), FEAT_ROW_H - 1);
     }
     // Intron / backbone line.
-    ctx.strokeStyle = selected ? COLORS.selected : COLORS.intron;
+    ctx.strokeStyle = kind ? exonColor : COLORS.intron;
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(x0, cy);
@@ -253,7 +275,7 @@ function render({ model, el }) {
         ctx.stroke();
       }
     }
-    ctx.fillStyle = selected ? COLORS.selected : COLORS.exon;
+    ctx.fillStyle = exonColor;
     if (f.exons && f.exons.length) {
       for (const [es, ee] of f.exons) {
         const ex0 = bpToPx(es);
@@ -264,7 +286,7 @@ function render({ model, el }) {
       // Exon-less span (a bare gene line): a slim bar, not a fake exon.
       ctx.fillRect(x0, cy - 1.5, Math.max(1, x1 - x0), 3);
     }
-    ctx.fillStyle = COLORS.cds;
+    ctx.fillStyle = cdsColor;
     for (const [cs, ce] of f.cds || []) {
       const cx0 = bpToPx(cs);
       const cw = Math.max(1, bpToPx(ce + 1) - cx0);
@@ -289,8 +311,9 @@ function render({ model, el }) {
     const first = Math.max(0, Math.floor((clipTop - rowsTop) / READ_ROW_H) - 1);
     const last = Math.ceil((clipBottom - rowsTop) / READ_ROW_H) + 1;
     const pw = plotWidth();
-    const exons = data.selected_exons || [];
-    const selecting = exons.length > 0;
+    const pos = data.pos_exons || [];
+    const neg = data.neg_exons || [];
+    const selecting = pos.length > 0 || neg.length > 0;
     for (const r of data.reads) {
       if (r.row < first || r.row > last) continue;
       const y = rowsTop + r.row * READ_ROW_H;
@@ -299,10 +322,10 @@ function render({ model, el }) {
       const x1all = bpToPx(r.end + 1);
       if (x1all < plotLeft() || x0all > plotLeft() + pw) continue;
       const base = r.strand === "-" ? COLORS.minus : COLORS.plus;
-      // With an isoform selected, incompatible reads fade right out; otherwise
-      // low mapping quality fades a little.
+      // With isoforms selected, reads that don't survive the filter fade out;
+      // otherwise low mapping quality fades a little.
       ctx.globalAlpha = selecting
-        ? (readCompatible(blocks, exons) ? 1 : FADED_ALPHA)
+        ? (readKept(blocks, pos, neg) ? 1 : FADED_ALPHA)
         : (r.mapq <= 0 ? 0.35 : r.mapq < 10 ? 0.6 : 1);
       // Connector line across the whole read (covers intron gaps).
       ctx.strokeStyle = COLORS.intron;
@@ -443,16 +466,19 @@ function render({ model, el }) {
       txt += `${readData.shown || 0} reads`;
       if (readData.truncated) txt += ` (sampled from ${readData.total})`;
       const sel = model.get("_selected") || {};
-      const exons = readData.selected_exons || [];
+      const pos = readData.pos_exons || [];
+      const neg = readData.neg_exons || [];
       const reads = readData.reads || [];
-      if (sel.transcript_id && exons.length && reads.length) {
-        let compat = 0;
+      if ((pos.length || neg.length) && reads.length) {
+        let kept = 0;
         for (const r of reads) {
-          if (readCompatible(r.blocks || [[r.start, r.end]], exons)) compat++;
+          if (readKept(r.blocks || [[r.start, r.end]], pos, neg)) kept++;
         }
-        txt += ` · ${compat}/${reads.length} compatible with ${sel.transcript_id}`;
-      } else if (sel.transcript_id && !exons.length) {
-        txt += ` · ${sel.transcript_id} (no exon model)`;
+        const posN = (sel.pos || []).map((x) => x.transcript_id);
+        const negN = (sel.neg || []).map((x) => x.transcript_id);
+        let desc = posN.length ? posN.join(" or ") : "any";
+        if (negN.length) desc += " but not " + negN.join(" or ");
+        txt += ` · ${kept}/${reads.length} kept (${desc})`;
       }
     }
     status.textContent = txt;
@@ -471,10 +497,31 @@ function render({ model, el }) {
     model.set("_selected", sel);
     model.save_changes();
   }
-  function toggleSelect(track, f) {
+  function hasSelection() {
     const s = model.get("_selected") || {};
-    if (s.transcript_id === f.transcript_id && s.track === track) setSelection({});
-    else setSelection({ track, transcript_id: f.transcript_id });
+    return (s.pos && s.pos.length) || (s.neg && s.neg.length);
+  }
+  // Plain click selects only this isoform (toggles off if it was the sole one);
+  // Shift-click adds/removes it from the positive (OR) set; Ctrl/Cmd-click
+  // adds/removes it from the negative (exclude) set.
+  function toggleSelect(track, f, mods) {
+    const s = model.get("_selected") || {};
+    const key = (x) => x.transcript_id === f.transcript_id && x.track === track;
+    let pos = (s.pos || []).slice();
+    let neg = (s.neg || []).slice();
+    const item = { track, transcript_id: f.transcript_id };
+    if (mods.ctrl) {
+      pos = pos.filter((x) => !key(x));
+      neg = neg.some(key) ? neg.filter((x) => !key(x)) : neg.concat([item]);
+    } else if (mods.shift) {
+      neg = neg.filter((x) => !key(x));
+      pos = pos.some(key) ? pos.filter((x) => !key(x)) : pos.concat([item]);
+    } else {
+      const solePos = pos.length === 1 && pos.some(key) && neg.length === 0;
+      pos = solePos ? [] : [item];
+      neg = [];
+    }
+    setSelection({ pos, neg });
   }
 
   let drag = null;
@@ -508,8 +555,12 @@ function render({ model, el }) {
       start: view.start,
       end: view.end,
       moved: false,
+      shift: e.shiftKey,
+      ctrl: e.ctrlKey || e.metaKey,
     };
   });
+  // Ctrl/Cmd-click is a valid "exclude" gesture; don't pop the context menu.
+  overlay.addEventListener("contextmenu", (e) => e.preventDefault());
   window.addEventListener("mousemove", (e) => {
     if (scrollDrag) {
       const rect = overlay.getBoundingClientRect();
@@ -561,8 +612,11 @@ function render({ model, el }) {
     // A click (no meaningful drag): select the isoform under the cursor, or
     // clear the selection when clicking empty space.
     const hit = featureAt(d.ox, d.oy);
-    if (hit && hit.f.transcript_id) toggleSelect(hit.track, hit.f);
-    else if (!hit && (model.get("_selected") || {}).transcript_id) setSelection({});
+    if (hit && hit.f.transcript_id) {
+      toggleSelect(hit.track, hit.f, { shift: d.shift, ctrl: d.ctrl });
+    } else if (!hit && hasSelection()) {
+      setSelection({});
+    }
   });
 
   overlay.addEventListener(
@@ -664,9 +718,11 @@ function render({ model, el }) {
           hit = `<b>${f.name || "feature"}</b><br>${view.chrom}:${fmtBp(f.start)}-${fmtBp(f.end)} (${f.strand})`;
           if (f.transcript_id) {
             hit += `<br>transcript ${f.transcript_id}`;
-            hit += isSelected(h.track, f)
-              ? "<br><i>click to deselect</i>"
-              : "<br><i>click to select isoform</i>";
+            const kind = selKind(h.track, f);
+            hit +=
+              kind === "pos" ? "<br><i>included (shift-click to remove)</i>"
+              : kind === "neg" ? "<br><i>excluded (ctrl-click to remove)</i>"
+              : "<br><i>click select · shift +include · ctrl +exclude</i>";
           }
           break;
         }
